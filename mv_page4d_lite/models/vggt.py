@@ -9,10 +9,10 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
-from vggt_t_mask_mlp_fin10.models.aggregator import Aggregator
-from vggt_t_mask_mlp_fin10.heads.camera_head import CameraHead
-from vggt_t_mask_mlp_fin10.heads.dpt_head import DPTHead
-from vggt_t_mask_mlp_fin10.heads.track_head import TrackHead
+from mv_page4d_lite.models.aggregator import Aggregator
+from mv_page4d_lite.heads.camera_head import CameraHead
+from mv_page4d_lite.heads.dpt_head import DPTHead
+from mv_page4d_lite.heads.track_head import TrackHead
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
@@ -29,18 +29,23 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         """
         Forward pass of the VGGT model.
         Args:
-            images (torch.Tensor): Input images with shape [S, 3, H, W] or [B, S, 3, H, W], in range [0, 1].
-                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            images (torch.Tensor): Input images with shape [S, 3, H, W], [B, S, 3, H, W], or [B, T, V, 3, H, W], in range [0, 1].
+                B: batch size
+                S: sequence length (legacy mode)
+                T: time steps (multi-view mode)
+                V: number of views (multi-view mode)
+                3: RGB channels
+                H: height, W: width
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
         Returns:
             dict: A dictionary containing the following predictions:
-                - pose_enc (torch.Tensor): Camera pose encoding with shape [B, S, 9] (from the last iteration)
-                - depth (torch.Tensor): Predicted depth maps with shape [B, S, H, W, 1]
-                - depth_conf (torch.Tensor): Confidence scores for depth predictions with shape [B, S, H, W]
-                - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
-                - world_points_conf (torch.Tensor): Confidence scores for world points with shape [B, S, H, W]
+                - pose_enc (torch.Tensor): Camera pose encoding with shape [B, S, 9] (legacy) or [B, V, 9] (multi-view)
+                - depth (torch.Tensor): Predicted depth maps with shape [B, S, H, W, 1] or [B, T, V, H, W, 1]
+                - depth_conf (torch.Tensor): Confidence scores for depth predictions
+                - world_points (torch.Tensor): 3D world coordinates for each pixel
+                - world_points_conf (torch.Tensor): Confidence scores for world points
                 - images (torch.Tensor): Original input images, preserved for visualization
 
                 If query_points is provided, also includes:
@@ -48,41 +53,77 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - vis (torch.Tensor): Visibility scores for tracked points with shape [B, S, N]
                 - conf (torch.Tensor): Confidence scores for tracked points with shape [B, S, N]
         """        
+        # Detect input format
+        is_multi_view = len(images.shape) == 6
+        
         # If without batch dimension, add it
-        if len(images.shape) == 4:
-            images = images.unsqueeze(0)
+        if is_multi_view:
+            if len(images.shape) == 5:
+                images = images.unsqueeze(0)
+            B, T, V, C, H, W = images.shape
+        else:
+            if len(images.shape) == 4:
+                images = images.unsqueeze(0)
+            B, S, C, H, W = images.shape
+            T = S
+            V = 1
             
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        # images: [B, S, 3, H, W]
-        # temporal_features: [B, S]
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images=images, temporal_features=temporal_features)
+        # images: [B, S, 3, H, W] or [B, T, V, 3, H, W]
+        # temporal_features: [B, S] or [B, T*V]
+        aggregated_tokens_list, patch_start_idx, mask_logits = self.aggregator(images=images, temporal_features=temporal_features)
         predictions = {}
+        
+        # Add mask_logits to predictions for supervision loss (if available)
+        if mask_logits is not None:
+            # mask_logits shape: [B*S, 1, H, W] where S = T*V for multi-view or S for legacy
+            # Convert to multi-view format if needed
+            if is_multi_view:
+                # Reshape from [B*T*V, 1, H, W] to [B, T, V, H, W]
+                B_total, _, H_mask, W_mask = mask_logits.shape
+                mask_logits = mask_logits.squeeze(1)  # [B*T*V, H, W]
+                mask_logits = mask_logits.view(B, T, V, H_mask, W_mask)  # [B, T, V, H, W]
+            else:
+                # Legacy format: [B*S, 1, H, W] -> [B, S, H, W]
+                B_total, _, H_mask, W_mask = mask_logits.shape
+                mask_logits = mask_logits.squeeze(1)  # [B*S, H, W]
+                mask_logits = mask_logits.view(B, S, H_mask, W_mask)  # [B, S, H, W]
+            
+            predictions["mask_logits"] = mask_logits
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list)
+                pose_enc_list = self.camera_head(
+                    aggregated_tokens_list,
+                    is_multi_view=is_multi_view,
+                    T=T if is_multi_view else None,
+                    V=V if is_multi_view else None
+                )
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
                 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx,
+                    is_multi_view=is_multi_view, T=T if is_multi_view else None, V=V if is_multi_view else None
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx,
+                    is_multi_view=is_multi_view, T=T if is_multi_view else None, V=V if is_multi_view else None
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points,
+                is_multi_view=is_multi_view, T=T if is_multi_view else None, V=V if is_multi_view else None
             )
             predictions["track"] = track_list[-1]  # track of the last iteration for inference
             predictions["track_list"] = track_list  # all iterations for training loss

@@ -16,10 +16,10 @@
             }
         },
         {
-            "name": "train.py",
+            "name": "train_mv_page4d_lite.py",
             "type": "python",
             "request": "launch",
-            "program": "train.py",
+            "program": "train_mv_page4d_lite.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [

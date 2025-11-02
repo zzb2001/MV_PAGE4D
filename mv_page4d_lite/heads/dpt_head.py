@@ -118,56 +118,91 @@ class DPTHead(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 8,
+        is_multi_view: bool = False,
+        T: int = None,
+        V: int = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
-            images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+            images (Tensor): Input images with shape [B, S, 3, H, W] (legacy) or [B, T, V, 3, H, W] (multi-view), in range [0, 1].
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
             frames_chunk_size (int, optional): Number of frames to process in each chunk.
                 If None or larger than S, all frames are processed at once. Default: 8.
+            is_multi_view (bool): Whether input is multi-view format [B, T, V, C, H, W]
+            T (int): Number of time steps (multi-view mode)
+            V (int): Number of views (multi-view mode)
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]:
-                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
-                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+                - If feature_only=True: Feature maps with shape [B, S, C, H, W] (legacy) or [B, T, V, C, H, W] (multi-view)
+                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W] (legacy) or [B, T, V, 1, H, W] (multi-view)
         """
-        B, S, _, H, W = images.shape
+        # Detect multi-view input format
+        if is_multi_view and len(images.shape) == 6:
+            B, T_in, V_in, C, H, W = images.shape
+            if T is not None and V is not None:
+                assert T_in == T and V_in == V, f"Mismatch: images has (T={T_in}, V={V_in}), but expected (T={T}, V={V})"
+            T = T_in
+            V = V_in
+            S = T * V
+            # Reshape to legacy format for processing: [B, T, V, C, H, W] -> [B, T*V, C, H, W]
+            images = images.reshape(B, T * V, C, H, W)
+        else:
+            B, S, _, H, W = images.shape
+            T = S
+            V = 1
 
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
-
-        # Otherwise, process frames in chunks to manage memory usage
-        assert frames_chunk_size > 0
-
-        # Process frames in batches
-        all_preds = []
-        all_conf = []
-
-        for frames_start_idx in range(0, S, frames_chunk_size):
-            frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
-
-            # Process batch of frames
-            if self.feature_only:
-                chunk_output = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
-                all_preds.append(chunk_output)
-            else:
-                chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
-                all_preds.append(chunk_preds)
-                all_conf.append(chunk_conf)
-
-        # Concatenate results along the sequence dimension
-        if self.feature_only:
-            return torch.cat(all_preds, dim=1)
+            result = self._forward_impl(aggregated_tokens_list, images, patch_start_idx, is_multi_view=is_multi_view, T=T, V=V)
         else:
-            return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
+            # Otherwise, process frames in chunks to manage memory usage
+            assert frames_chunk_size > 0
+
+            # Process frames in batches
+            all_preds = []
+            all_conf = []
+
+            for frames_start_idx in range(0, S, frames_chunk_size):
+                frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
+
+                # Process batch of frames
+                if self.feature_only:
+                    chunk_output = self._forward_impl(
+                        aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                        is_multi_view=is_multi_view, T=T, V=V
+                    )
+                    all_preds.append(chunk_output)
+                else:
+                    chunk_preds, chunk_conf = self._forward_impl(
+                        aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                        is_multi_view=is_multi_view, T=T, V=V
+                    )
+                    all_preds.append(chunk_preds)
+                    all_conf.append(chunk_conf)
+
+            # Concatenate results along the sequence dimension
+            if self.feature_only:
+                result = torch.cat(all_preds, dim=1)
+            else:
+                result = (torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1))
+        
+        # Reshape back to multi-view format if needed
+        if is_multi_view and T is not None and V is not None:
+            if self.feature_only:
+                # result is [B, T*V, C, H, W] -> [B, T, V, C, H, W]
+                result = result.reshape(B, T, V, *result.shape[2:])
+            else:
+                # result is tuple of ([B, T*V, ...], [B, T*V, ...]) -> ([B, T, V, ...], [B, T, V, ...])
+                preds, conf = result
+                preds = preds.reshape(B, T, V, *preds.shape[2:])
+                conf = conf.reshape(B, T, V, *conf.shape[2:])
+                result = (preds, conf)
+        
+        return result
 
     def _forward_impl(
         self,
@@ -176,6 +211,9 @@ class DPTHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        is_multi_view: bool = False,
+        T: int = None,
+        V: int = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Implementation of the forward pass through the DPT head.
@@ -184,10 +222,13 @@ class DPTHead(nn.Module):
 
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
-            images (Tensor): Input images with shape [B, S, 3, H, W].
+            images (Tensor): Input images with shape [B, S, 3, H, W] (legacy) or [B, T*V, 3, H, W] (multi-view reshaped).
             patch_start_idx (int): Starting index for patch tokens.
             frames_start_idx (int, optional): Starting index for frames to process.
             frames_end_idx (int, optional): Ending index for frames to process.
+            is_multi_view (bool): Whether input was originally multi-view format
+            T (int): Number of time steps (multi-view mode)
+            V (int): Number of views (multi-view mode)
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).

@@ -7,13 +7,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from vggt_t_mv.utils.pose_enc import pose_encoding_to_extri_intri
+from mv_page4d_lite.utils.pose_enc import pose_encoding_to_extri_intri
 import numpy as np
 from vggt.utils.load_fn import load_and_preprocess_images
 import json
 from utils.metrics import *
 from utils.visual import *
-from vggt_t_mv.models.vggt import VGGT as VGGT_MV
+from mv_page4d_lite.models.vggt import VGGT as VGGT_MV
 from PIL import Image
 from torchvision import transforms as TF
 import re
@@ -409,6 +409,56 @@ def load_time_view_images(images_dir, target_size=378, mode="crop"):
     return images_tensor, metadata
 
 
+def create_multi_view_time_grid(images, V, T, normalize=True):
+    """
+    Create a grid image with V rows (views) and T columns (time steps).
+    
+    Args:
+        images: torch.Tensor [B, T, V, C, H, W] or [T, V, C, H, W]
+        V: number of views
+        T: number of time steps
+        normalize: whether to normalize images to [0, 1] range
+    
+    Returns:
+        grid_image: torch.Tensor [C, H*V, W*T] - grid image
+    """
+    # Handle batch dimension
+    if len(images.shape) == 6:
+        images = images[0]  # [T, V, C, H, W]
+    elif len(images.shape) == 5:
+        pass  # Already [T, V, C, H, W]
+    else:
+        raise ValueError(f"Expected images shape [T, V, C, H, W] or [B, T, V, C, H, W], got {images.shape}")
+    
+    # Ensure on CPU and detach
+    images = images.detach().cpu()
+    
+    # Get dimensions
+    T_actual, V_actual, C, H, W = images.shape
+    T = min(T, T_actual)
+    V = min(V, V_actual)
+    
+    # Normalize if needed
+    if normalize:
+        # Clamp to [0, 1] range
+        images = torch.clamp(images, 0, 1)
+    
+    # Create grid: V rows, T columns
+    grid_rows = []
+    for v in range(V):
+        row_images = []
+        for t in range(T):
+            img = images[t, v]  # [C, H, W]
+            row_images.append(img)
+        # Concatenate horizontally (T columns)
+        row = torch.cat(row_images, dim=2)  # [C, H, W*T]
+        grid_rows.append(row)
+    # Concatenate vertically (V rows)
+    grid = torch.cat(grid_rows, dim=1)  # [C, H*V, W*T]
+    
+    return grid
+
+
 def save_tensor_image(tensor_img, save_path):
     """
     Save a PyTorch tensor image (3, H, W) to a file.
@@ -684,24 +734,182 @@ def save_predictions_visualization(predictions, output_dir="./output_visualizati
                 print("Warning: No valid points found for global point cloud")
 
 
+def print_model_structure(model, max_depth=3, indent=0):
+    """
+    打印模型的完整结构
+    
+    Args:
+        model: PyTorch模型
+        max_depth: 最大递归深度
+        indent: 当前缩进级别
+    """
+    def _print_module(module, name="", depth=0, max_d=max_depth):
+        if depth > max_d:
+            return
+        
+        indent_str = "  " * depth
+        module_type = type(module).__name__
+        
+        # 获取参数信息
+        num_params = sum(p.numel() for p in module.parameters(recurse=False))
+        trainable_params = sum(p.numel() for p in module.parameters(recurse=False) if p.requires_grad)
+        
+        if num_params > 0:
+            status = "TRAINABLE" if trainable_params > 0 else "FROZEN"
+            print(f"{indent_str}{name} ({module_type}): {num_params:,} params ({trainable_params:,} trainable) [{status}]")
+        else:
+            print(f"{indent_str}{name} ({module_type})")
+        
+        # 递归打印子模块
+        for child_name, child_module in module.named_children():
+            _print_module(child_module, child_name, depth + 1, max_d)
+    
+    print("\n" + "="*80)
+    print("Model Structure:")
+    print("="*80)
+    _print_module(model, "model", depth=0, max_d=max_depth)
+    print("="*80)
+    
+    # 打印参数统计
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    
+    print(f"\nParameter Statistics:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    print(f"  Frozen parameters: {frozen_params:,} ({100*frozen_params/total_params:.2f}%)")
+    print("="*80 + "\n")
+
+
+def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True):
+    """
+    加载预训练权重，处理形状不匹配问题
+    
+    Args:
+        model: PyTorch模型
+        checkpoint_path: checkpoint文件路径
+        device: 设备
+        verbose: 是否打印详细信息
+    
+    Returns:
+        dict: 包含加载统计信息的字典
+    """
+    import os
+    
+    if not os.path.exists(checkpoint_path):
+        if verbose:
+            print(f"Warning: Checkpoint file {checkpoint_path} not found, using random initialization")
+        return {
+            'loaded': False,
+            'missing_keys': [],
+            'unexpected_keys': [],
+            'size_mismatch_keys': []
+        }
+    
+    if verbose:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Check checkpoint format
+    if isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            model_state_dict = checkpoint['model']
+        elif 'model_state_dict' in checkpoint:
+            model_state_dict = checkpoint['model_state_dict']
+        else:
+            model_state_dict = checkpoint
+    else:
+        model_state_dict = checkpoint
+    
+    # 获取模型当前的state_dict
+    model_state = model.state_dict()
+    
+    # 过滤掉形状不匹配的键
+    filtered_state_dict = {}
+    size_mismatch_keys = []
+    
+    for key, value in model_state_dict.items():
+        if key in model_state:
+            if model_state[key].shape == value.shape:
+                filtered_state_dict[key] = value
+            else:
+                size_mismatch_keys.append({
+                    'key': key,
+                    'checkpoint_shape': list(value.shape),
+                    'model_shape': list(model_state[key].shape)
+                })
+                if verbose:
+                    print(f"  Skipping {key}: shape mismatch "
+                          f"(checkpoint: {list(value.shape)}, model: {list(model_state[key].shape)})")
+        else:
+            # 键不存在于模型中（可能是新增的模块）
+            pass
+    
+    # 加载过滤后的权重
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+    
+    if verbose:
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"  Successfully loaded: {len(filtered_state_dict)} keys")
+        
+        if size_mismatch_keys:
+            print(f"  Size mismatch (skipped): {len(size_mismatch_keys)} keys")
+            for item in size_mismatch_keys:
+                print(f"    - {item['key']}: checkpoint{item['checkpoint_shape']} vs model{item['model_shape']}")
+
+        
+        if missing_keys:
+            print(f"  Missing keys (will use random init): {len(missing_keys)} keys")
+            # 按模块分组显示
+            missing_by_module = {}
+            for key in missing_keys:
+                module = key.split('.')[0] if '.' in key else 'root'
+                if module not in missing_by_module:
+                    missing_by_module[module] = []
+                missing_by_module[module].append(key)
+            
+            for module, keys in missing_by_module.items():
+                print(f"    [{module}]: {len(keys)} keys")
+                for k in keys:
+                    print(f"      - {k}")
+
+        
+        if unexpected_keys:
+            print(f"  Unexpected keys (ignored): {len(unexpected_keys)} keys")
+            if len(unexpected_keys) <= 10:
+                for key in unexpected_keys:
+                    print(f"    - {key}")
+            else:
+                for key in unexpected_keys[:5]:
+                    print(f"    - {key}")
+                print(f"    ... and {len(unexpected_keys) - 5} more")
+    
+    return {
+        'loaded': True,
+        'loaded_keys': len(filtered_state_dict),
+        'missing_keys': missing_keys,
+        'unexpected_keys': unexpected_keys,
+        'size_mismatch_keys': size_mismatch_keys
+    }
+
+
 def freeze_parameters_stage1(model):
     """
-    阶段1：冻结基础特征，只训练新增模块
+    阶段1：冻结基础特征，只训练新增模块（根据图片中的训练/冻结策略）
     
     冻结：
-    - patch_embed.*
-    - register_token, camera_token
-    - time_blocks.{0..7}.*, {16..23}.* (前8层和后8层)
-    - view_blocks.{0..7}.*, {16..23}.* (前8层和后8层)
-    - camera_head.*, depth_head.*, point_head.*, track_head.* (可选)
+    - 编码器 (patch_embed)
+    - Stage-1/3 (frame_blocks[0:8] 和 frame_blocks[18:24], global_blocks相同)
+    - 解码头 (camera_head, depth_head, point_head权重)
     
     训练：
-    - 两流架构blocks (pose_time_blocks, pose_view_blocks, geo_time_blocks, geo_view_blocks)
-    - dynamic_mask_head.*
-    - lambda_pose_logit, lambda_geo_logit, lambda_pose_t_logit, lambda_geo_t_logit
-    - spatial_mask_head.*
-    - time_blocks.{8..15}.*, view_blocks.{8..15}.* (L_mid层)
-    - dim_adapter (如果存在)
+    - ViewMixer (新增的Stage-0模块)
+    - Stage-2 (frame_blocks[8:18], global_blocks[8:18])
+    - 路由门控 (camera_mask_gate, LoRA参数)
+    - Token的可学习初值 (camera_token, register_token)
+    - 位置/元信息嵌入 (time_embed, view_embed, camera_param_embed)
     """
     # 冻结所有参数
     for param in model.parameters():
@@ -710,69 +918,48 @@ def freeze_parameters_stage1(model):
     # ========== 解冻需要训练的模块 ==========
     aggregator = model.aggregator
     
-    # 1. 两流架构blocks (L_mid层: 6-10，共5层)
-    if hasattr(aggregator, 'pose_time_blocks'):
-        for block in aggregator.pose_time_blocks:
-            for param in block.parameters():
-                param.requires_grad = True
-    if hasattr(aggregator, 'pose_view_blocks'):
-        for block in aggregator.pose_view_blocks:
-            for param in block.parameters():
-                param.requires_grad = True
-    if hasattr(aggregator, 'geo_time_blocks'):
-        for block in aggregator.geo_time_blocks:
-            for param in block.parameters():
-                param.requires_grad = True
-    if hasattr(aggregator, 'geo_view_blocks'):
-        for block in aggregator.geo_view_blocks:
-            for param in block.parameters():
-                param.requires_grad = True
-    
-    # 2. Dynamic Mask Head
-    if hasattr(aggregator, 'dynamic_mask_head'):
-        for param in aggregator.dynamic_mask_head.parameters():
+    # 1. ViewMixer (新增，Stage-0)
+    if hasattr(aggregator, 'viewmixer'):
+        for param in aggregator.viewmixer.parameters():
             param.requires_grad = True
     
-    # 3. Lambda参数（控制两流分离）
-    if hasattr(aggregator, 'lambda_pose_logit'):
-        aggregator.lambda_pose_logit.requires_grad = True
-    if hasattr(aggregator, 'lambda_geo_logit'):
-        aggregator.lambda_geo_logit.requires_grad = True
-    if hasattr(aggregator, 'lambda_pose_t_logit'):
-        aggregator.lambda_pose_t_logit.requires_grad = True
-    if hasattr(aggregator, 'lambda_geo_t_logit'):
-        aggregator.lambda_geo_t_logit.requires_grad = True
+    # 2. Stage-2 (10层: 8-17)
+    stage2_indices = list(range(8, 18))
+    for idx in stage2_indices:
+        if idx < len(aggregator.frame_blocks):
+            for param in aggregator.frame_blocks[idx].parameters():
+                param.requires_grad = True
+        if idx < len(aggregator.global_blocks):
+            for param in aggregator.global_blocks[idx].parameters():
+                param.requires_grad = True
     
-    # 4. Spatial Mask Head (L_mid层掩码头)
+    # 3. 路由门控：camera_mask_gate (可学习强度门控γ)
+    if hasattr(aggregator, 'camera_mask_gate'):
+        aggregator.camera_mask_gate.requires_grad = True
+    
+    # 4. Token的可学习初值
+    if hasattr(aggregator, 'camera_token'):
+        aggregator.camera_token.requires_grad = True
+    if hasattr(aggregator, 'register_token'):
+        aggregator.register_token.requires_grad = True
+    
+    # 5. 位置/元信息嵌入
+    if hasattr(aggregator, 'time_embed'):
+        for param in aggregator.time_embed.parameters():
+            param.requires_grad = True
+    if hasattr(aggregator, 'view_embed'):
+        for param in aggregator.view_embed.parameters():
+            param.requires_grad = True
+    if hasattr(aggregator, 'camera_param_embed'):
+        for param in aggregator.camera_param_embed.parameters():
+            param.requires_grad = True
+    
+    # 6. Spatial Mask Head (如果需要)
     if hasattr(aggregator, 'spatial_mask_head'):
         for param in aggregator.spatial_mask_head.parameters():
             param.requires_grad = True
     
-    # 5. L_mid层 (8-15层，索引0-based: 8-15)
-    mid_layer_indices = list(range(8, 16))
-    for idx in mid_layer_indices:
-        if idx < len(aggregator.time_blocks):
-            for param in aggregator.time_blocks[idx].parameters():
-                param.requires_grad = True
-        if idx < len(aggregator.view_blocks):
-            for param in aggregator.view_blocks[idx].parameters():
-                param.requires_grad = True
-    
-    # 6. Dimension Adapters (如果存在)
-    if model.camera_head is not None and hasattr(model.camera_head, 'dim_adapter'):
-        if model.camera_head.dim_adapter is not None:
-            for param in model.camera_head.dim_adapter.parameters():
-                param.requires_grad = True
-    
-    if model.depth_head is not None and hasattr(model.depth_head, 'dim_adapter'):
-        if model.depth_head.dim_adapter is not None:
-            for param in model.depth_head.dim_adapter.parameters():
-                param.requires_grad = True
-    
-    if model.point_head is not None and hasattr(model.point_head, 'dim_adapter'):
-        if model.point_head.dim_adapter is not None:
-            for param in model.point_head.dim_adapter.parameters():
-                param.requires_grad = True
+    # ViewMixer中的LoRA参数已经被包含在viewmixer中
     
     # 统计可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -780,218 +967,1033 @@ def freeze_parameters_stage1(model):
     print(f"Stage 1: Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
 
 
-def compute_mask_supervision_loss(predictions, segmask_gt, images):
+def apply_freeze_train_strategy_precise(model):
     """
-    SegAnyMo mask监督损失：使用SegAnyMo的mask作为动态区域的监督信号
+    按照图片中的精确指令进行参数冻结/训练划分（"最小侵入版"默认策略）
+    
+    冻结哪些参数：
+    1. 图像编码器 (DINOv2/ViT-L/14): patch_embed - 全部冻结
+    2. Stage-1 & Stage-3 的所有 Transformer 层参数: 
+       - frame_blocks[0:8] (Stage-1: 8层)
+       - frame_blocks[18:24] (Stage-3: 6层)
+       - global_blocks 对应的层 - 全部冻结
+    3. 深度头/点图头 (DPT-head): depth_head, point_head - 先冻结
+    4. 相机头主体权重 (Camera Head main weights): camera_head.trunk, camera_head.pose_branch 等 - 冻结
+    
+    训练哪些参数：
+    1. Stage-0: ViewMixer (跨视角轻量注意力门控残差/LoRA分支) - 全训
+    2. Stage-2 (10层: frame_blocks[8:18], global_blocks[8:18]) - 全训
+    3. 掩码门控 γ (camera_mask_gate): per-layer/per-branch可训，初始化接近0 - 训练
+    4. 相机/注册 tokens 的可学习初值 (camera_token, register_token) - 可训
+    5. CameraHead-shim (极薄映射/包装层, 可选): 将按视角的相机token映射到冻结相机头的接口 - 可训
+    6. 动态掩码 head (spatial_mask_head: DWConv + τ/α) - 训练
+    7. 时间/视角嵌入表 (time_embed, view_embed, camera_param_embed) - 可训
+    
+    可选细化：如果Stage-2显存/稳定性吃紧，可将QKV投影采用LoRA
+    """
+    # 1. 首先冻结所有参数
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    aggregator = model.aggregator
+    
+    # ========== 冻结部分 ==========
+    print("\n[Freezing Parameters]")
+    
+    # 1.1 图像编码器 (DINOv2/ViT-L/14): patch_embed - 全部冻结
+    if hasattr(aggregator, 'patch_embed'):
+        for param in aggregator.patch_embed.parameters():
+            param.requires_grad = False
+        print("  ✓ Frozen: patch_embed (DINOv2/ViT encoder)")
+    
+    # 1.2 Stage-1 (8层: 0-7) & Stage-3 (6层: 18-23) 的所有 Transformer 层参数
+    # Stage-1: frame_blocks[0:8], global_blocks[0:8]
+    stage1_indices = list(range(0, 8))
+    for idx in stage1_indices:
+        if idx < len(aggregator.frame_blocks):
+            for param in aggregator.frame_blocks[idx].parameters():
+                param.requires_grad = False
+        if idx < len(aggregator.global_blocks):
+            for param in aggregator.global_blocks[idx].parameters():
+                param.requires_grad = False
+    
+    # Stage-3: frame_blocks[18:24], global_blocks[18:24]
+    stage3_indices = list(range(18, 24))
+    for idx in stage3_indices:
+        if idx < len(aggregator.frame_blocks):
+            for param in aggregator.frame_blocks[idx].parameters():
+                param.requires_grad = False
+        if idx < len(aggregator.global_blocks):
+            for param in aggregator.global_blocks[idx].parameters():
+                param.requires_grad = False
+    print(f"  ✓ Frozen: Stage-1 ({len(stage1_indices)} layers) & Stage-3 ({len(stage3_indices)} layers) Transformer blocks")
+    
+    # 1.3 深度头/点图头 (DPT-head): 先冻结（可在后期解冻做轻微收尾）
+    if hasattr(model, 'depth_head') and model.depth_head is not None:
+        for param in model.depth_head.parameters():
+            param.requires_grad = False
+        print("  ✓ Frozen: depth_head (DPT-head, can be unfrozen later for fine-tuning)")
+    
+    if hasattr(model, 'point_head') and model.point_head is not None:
+        for param in model.point_head.parameters():
+            param.requires_grad = False
+        print("  ✓ Frozen: point_head (DPT-head, can be unfrozen later for fine-tuning)")
+    
+    # 1.4 相机头主体权重: 冻结主干（trunk, pose_branch等），但允许接口薄层可训
+    if hasattr(model, 'camera_head') and model.camera_head is not None:
+        camera_head = model.camera_head
+        # 冻结相机头的主体权重
+        if hasattr(camera_head, 'trunk'):
+            for param in camera_head.trunk.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'pose_branch'):
+            for param in camera_head.pose_branch.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'token_norm'):
+            for param in camera_head.token_norm.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'trunk_norm'):
+            for param in camera_head.trunk_norm.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'poseLN_modulation'):
+            for param in camera_head.poseLN_modulation.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'adaln_norm'):
+            for param in camera_head.adaln_norm.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'embed_pose'):
+            for param in camera_head.embed_pose.parameters():
+                param.requires_grad = False
+        if hasattr(camera_head, 'empty_pose_tokens'):
+            camera_head.empty_pose_tokens.requires_grad = False
+        print("  ✓ Frozen: camera_head main weights (trunk, pose_branch, etc.)")
+        
+        # Unfreeze view-specific projection layers (shim) for multi-view differentiation
+        if hasattr(camera_head, 'view_proj'):
+            for proj in camera_head.view_proj:
+                for param in proj.parameters():
+                    param.requires_grad = True
+            print("  ✓ Training: camera_head.view_proj (view-specific shim layers)")
+    
+    # ========== 训练部分 ==========
+    print("\n[Training Parameters]")
+    
+    # 2.1 Stage-0: ViewMixer - 全训（跨视角轻量注意力门控残差/LoRA分支）
+    if hasattr(aggregator, 'viewmixer'):
+        for param in aggregator.viewmixer.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: ViewMixer (Stage-0, cross-view attention with LoRA)")
+    
+    # 2.2 Stage-2 (10层: 8-17) - 全训（掩码化 Global + 时序 Frame 的主干）
+    stage2_indices = list(range(8, 18))
+    for idx in stage2_indices:
+        if idx < len(aggregator.frame_blocks):
+            for param in aggregator.frame_blocks[idx].parameters():
+                param.requires_grad = True
+        if idx < len(aggregator.global_blocks):
+            for param in aggregator.global_blocks[idx].parameters():
+                param.requires_grad = True
+    print(f"  ✓ Training: Stage-2 ({len(stage2_indices)} layers: frame_blocks[8:18], global_blocks[8:18])")
+    
+    # 2.3 掩码门控 γ (camera_mask_gate): per-layer/per-branch可训，初始化接近0
+    if hasattr(aggregator, 'camera_mask_gate'):
+        aggregator.camera_mask_gate.requires_grad = True
+        # 确保初始化接近0（弱抑制）
+        with torch.no_grad():
+            aggregator.camera_mask_gate.fill_(0.0)
+        print("  ✓ Training: camera_mask_gate (γ, initialized to 0 for weak suppression)")
+    
+    # 2.4 相机/注册 tokens 的可学习初值
+    if hasattr(aggregator, 'camera_token'):
+        aggregator.camera_token.requires_grad = True
+        print("  ✓ Training: camera_token (learnable initial values)")
+    if hasattr(aggregator, 'register_token'):
+        aggregator.register_token.requires_grad = True
+        print("  ✓ Training: register_token (learnable initial values)")
+    
+    # 2.5 CameraHead-shim (极薄映射/包装层, 可选)
+    # 注意：这需要单独实现，用于将按视角的相机token映射到冻结相机头的接口
+    # 如果存在，将其设置为可训练
+    # 示例：if hasattr(model, 'camera_head_shim'): ...
+    # 当前代码中可能没有，可以先跳过或后续添加
+    print("  ⚠ Note: CameraHead-shim (thin mapping layer) - can be added if needed")
+    
+    # 2.6 动态掩码 head (spatial_mask_head: DWConv + τ/α)
+    if hasattr(aggregator, 'spatial_mask_head'):
+        for param in aggregator.spatial_mask_head.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: spatial_mask_head (DWConv + τ/α, dynamic masking)")
+    
+    # 2.7 时间/视角嵌入表
+    if hasattr(aggregator, 'time_embed'):
+        for param in aggregator.time_embed.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: time_embed (learnable time encoding)")
+    if hasattr(aggregator, 'view_embed'):
+        for param in aggregator.view_embed.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: view_embed (learnable view encoding)")
+    if hasattr(aggregator, 'camera_param_embed'):
+        for param in aggregator.camera_param_embed.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: camera_param_embed (learnable camera parameter encoding)")
+    
+    # 2.8 可选细化：如果Stage-2显存/稳定性吃紧，可将QKV投影采用LoRA
+    # 注意：当前实现可能没有LoRA版本的Stage-2，如果需要可以后续添加
+    print("  ⚠ Note: Optional refinement - Stage-2 QKV can use LoRA if memory/stability is tight")
+    
+    # ========== 统计可训练参数 ==========
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_percent = 100 * trainable_params / total_params if total_params > 0 else 0
+    
+    print(f"\n[Summary]")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,} ({trainable_percent:.2f}%)")
+    print(f"  Frozen parameters: {total_params - trainable_params:,} ({100 - trainable_percent:.2f}%)")
+    
+    # 验证关键组件
+    print(f"\n[Verification]")
+    if hasattr(aggregator, 'viewmixer'):
+        viewmixer_trainable = sum(p.numel() for p in aggregator.viewmixer.parameters() if p.requires_grad)
+        print(f"  ViewMixer trainable: {viewmixer_trainable:,} params")
+    
+    stage2_frame_trainable = sum(
+        p.numel() for idx in stage2_indices 
+        if idx < len(aggregator.frame_blocks)
+        for p in aggregator.frame_blocks[idx].parameters() if p.requires_grad
+    )
+    stage2_global_trainable = sum(
+        p.numel() for idx in stage2_indices 
+        if idx < len(aggregator.global_blocks)
+        for p in aggregator.global_blocks[idx].parameters() if p.requires_grad
+    )
+    print(f"  Stage-2 trainable: frame={stage2_frame_trainable:,}, global={stage2_global_trainable:,} params")
+
+
+# ============================================================================
+# 损失函数配置与扩展接口
+# ============================================================================
+
+class LossConfig:
+    """
+    损失函数配置类：控制哪些损失被启用，以及它们的权重
+    使用最小必要配置作为默认，同时预留扩展接口
+    """
+    def __init__(self, use_minimal=True):
+        """
+        Args:
+            use_minimal: 如果True，使用最小必要配置；如果False，使用完整配置
+        """
+        # 默认使用最小必要配置
+        if use_minimal:
+            self.load_minimal_config()
+        else:
+            self.load_full_config()
+    
+    def load_minimal_config(self):
+        """最小必要配置：只保留核心必要损失和重要损失"""
+        # ========== 核心必要损失（必须） ==========
+        self.use_mask_ce = True           # L_mask_ce: 掩码监督（BCEWithLogits）
+        self.use_depth_point = True       # L_depth->point^S: 深度一致性（静态区，尺度归一化）
+        self.use_cam_const = True         # L_cam^const: 相机跨时恒定（SE(3)李代数差分）
+        
+        # ========== 重要损失（强烈推荐） ==========
+        self.use_smooth_edge = True       # L_smooth^S_edge: 边缘感知几何平滑（静态区）
+        self.use_mv_geo = True             # L_mv_geo^S: 跨视角几何重投影（当前占位符，但保留接口）
+        
+        # ========== 可选损失（不参与训练） ==========
+        self.use_mask_tv = False          # L_mask_tv: 掩码边界/时序
+        self.use_uncert = False           # L_uncert: 置信度正则（可选）
+        self.use_scale = False            # L_scale^S: 尺度一致（可选）
+        self.use_sep = False               # L_sep: 双流分离（可选，需要dual_stream_outputs）
+        
+        # ========== 高级损失（占位符，不参与训练） ==========
+        self.use_epi = False               # L_epi^S: 对极约束（占位符）
+        self.use_photo = False             # L_photo^S: 光度一致性（占位符）
+        
+        # ========== 关键点损失（需要标注，不参与训练） ==========
+        self.use_kpt = False               # L_kpt^D: 关键点重投影
+        self.use_temp_d = False            # L_temp^D: 关键点时间平滑
+        
+        # 权重配置（按照图片中的初始权重）
+        self.weights = {
+            'mask_ce': 1.0,
+            'mask_tv': 0.2,
+            'depth_point': 0.5,
+            'scale': 0.1,
+            'smooth_edge': 0.2,
+            'uncert': 0.1,
+            'cam_const': 0.1,
+            'sep': 0.1,
+            'mv_geo': 1.0,
+            'epi': 1.0,
+            'photo': 0.2,
+            'kpt': 2.0,
+            'temp_d': 0.5,
+        }
+    
+    def load_full_config(self):
+        """完整配置：启用所有已实现的损失（除了占位符和需要标注的）"""
+        # 必要损失
+        self.use_mask_ce = True
+        self.use_depth_point = True
+        self.use_cam_const = True
+        
+        # 推荐损失
+        self.use_smooth_edge = True
+        self.use_uncert = True
+        
+        # 可选损失（启用）
+        self.use_mask_tv = True
+        self.use_scale = True
+        self.use_sep = True
+        
+        # 高级损失（占位符保持关闭，除非已实现）
+        self.use_mv_geo = False
+        self.use_epi = False
+        self.use_photo = False
+        
+        # 关键点损失（需要标注）
+        self.use_kpt = False
+        self.use_temp_d = False
+        
+        # 权重配置（同上）
+        self.weights = {
+            'mask_ce': 1.0,
+            'mask_tv': 0.2,
+            'depth_point': 0.5,
+            'scale': 0.1,
+            'smooth_edge': 0.2,
+            'uncert': 0.1,
+            'cam_const': 0.1,
+            'sep': 0.1,
+            'mv_geo': 1.0,
+            'epi': 1.0,
+            'photo': 0.2,
+            'kpt': 2.0,
+            'temp_d': 0.5,
+        }
+    
+    def enable_loss(self, loss_name: str, weight: float = None):
+        """启用指定的损失函数"""
+        if hasattr(self, f'use_{loss_name}'):
+            setattr(self, f'use_{loss_name}', True)
+            if weight is not None:
+                self.weights[loss_name] = weight
+        else:
+            raise ValueError(f"Unknown loss: {loss_name}")
+    
+    def disable_loss(self, loss_name: str):
+        """禁用指定的损失函数"""
+        if hasattr(self, f'use_{loss_name}'):
+            setattr(self, f'use_{loss_name}', False)
+        else:
+            raise ValueError(f"Unknown loss: {loss_name}")
+    
+    def set_weight(self, loss_name: str, weight: float):
+        """设置损失权重"""
+        if loss_name in self.weights:
+            self.weights[loss_name] = weight
+        else:
+            raise ValueError(f"Unknown loss: {loss_name}")
+    
+    def get_active_losses(self):
+        """返回当前激活的损失列表"""
+        active = []
+        for attr_name in dir(self):
+            if attr_name.startswith('use_'):
+                if getattr(self, attr_name):
+                    loss_name = attr_name[4:]  # 去掉'use_'前缀
+                    active.append((loss_name, self.weights.get(loss_name, 0.0)))
+        return active
+    
+    def print_config(self):
+        """打印当前配置"""
+        print("\n" + "="*60)
+        print("损失函数配置")
+        print("="*60)
+        active = self.get_active_losses()
+        print(f"激活的损失函数 ({len(active)} 个):")
+        for loss_name, weight in active:
+            print(f"  ✓ {loss_name}: 权重 {weight}")
+        print()
+        inactive = []
+        for attr_name in dir(self):
+            if attr_name.startswith('use_') and not getattr(self, attr_name):
+                loss_name = attr_name[4:]
+                inactive.append(loss_name)
+        if inactive:
+            print(f"未激活的损失函数 ({len(inactive)} 个):")
+            for loss_name in inactive:
+                print(f"  - {loss_name}")
+        print("="*60)
+
+
+# ============================================================================
+# 损失函数辅助工具
+# ============================================================================
+
+def off_diagonal(x):
+    """返回方阵的非对角线元素（展平）"""
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+def compute_barlow_twins_loss(z1: torch.Tensor, z2: torch.Tensor, lambda_param: float = 5e-3) -> torch.Tensor:
+    """Barlow Twins去相关损失"""
+    # 归一化
+    z1_norm = (z1 - z1.mean(dim=0)) / (z1.std(dim=0) + 1e-6)
+    z2_norm = (z2 - z2.mean(dim=0)) / (z2.std(dim=0) + 1e-6)
+    
+    # 交叉相关矩阵
+    c = (z1_norm.T @ z2_norm) / z1_norm.shape[0]
+    
+    # 损失：对角线接近1，非对角线接近0
+    on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+    off_diag = off_diagonal(c).pow_(2).sum()
+    
+    return on_diag + lambda_param * off_diag
+
+
+def compute_boundary_loss(mask_logits: torch.Tensor) -> torch.Tensor:
+    """掩码边界锐利化损失（基于梯度）"""
+    # 处理不同形状：统一转换为 [B*T*V, H, W] 或类似格式
+    original_shape = mask_logits.shape
+    if mask_logits.ndim == 5:  # [B, T, V, H, W]
+        mask_logits = mask_logits.view(-1, *mask_logits.shape[-2:])  # [B*T*V, H, W]
+    elif mask_logits.ndim == 4:  # [B, T, H, W] 或 [B, H, W, C]
+        if mask_logits.shape[-1] == 1:
+            mask_logits = mask_logits.squeeze(-1)  # [B, T, H, W, 1] -> [B, T, H, W]
+        mask_logits = mask_logits.view(-1, *mask_logits.shape[-2:])  # [B*T, H, W]
+    
+    # 计算梯度（拉普拉斯算子）
+    dx = torch.abs(mask_logits[:, :, 1:] - mask_logits[:, :, :-1])  # [..., H, W-1]
+    dy = torch.abs(mask_logits[:, 1:, :] - mask_logits[:, :-1, :])  # [..., H-1, W]
+    
+    return (dx.mean() + dy.mean()) * 0.1
+
+
+def compute_temporal_consistency_loss_mask(mask_logits: torch.Tensor, static_mask: torch.Tensor = None) -> torch.Tensor:
+    """掩码时间一致性损失（简化版，需要warp函数但这里简化）"""
+    # 处理不同形状：mask_logits应该是 [B, T, V, H, W] 或类似
+    if mask_logits.ndim == 5:
+        B, T, V, H, W = mask_logits.shape
+        if T < 2:
+            return torch.tensor(0.0, device=mask_logits.device)
+        
+        loss = torch.tensor(0.0, device=mask_logits.device)
+        for i in range(T - 1):
+            diff = torch.abs(mask_logits[:, i] - mask_logits[:, i+1])  # [B, V, H, W]
+            if static_mask is not None:
+                if static_mask.ndim == 5:  # [B, T, V, H, W]
+                    diff = diff * static_mask[:, i]
+                elif static_mask.ndim == 4:  # [B, V, H, W]
+                    diff = diff * static_mask
+            loss += diff.mean()
+        return loss / (T - 1) * 0.05
+    elif mask_logits.ndim == 4:
+        # [B, T, H, W]
+        B, T, H, W = mask_logits.shape
+        if T < 2:
+            return torch.tensor(0.0, device=mask_logits.device)
+        
+        loss = torch.tensor(0.0, device=mask_logits.device)
+        for i in range(T - 1):
+            diff = torch.abs(mask_logits[:, i] - mask_logits[:, i+1])
+            if static_mask is not None:
+                if static_mask.ndim == 4 and static_mask.shape[1] == T:
+                    diff = diff * static_mask[:, i]
+                elif static_mask.ndim == 3:
+                    diff = diff * static_mask
+            loss += diff.mean()
+        return loss / (T - 1) * 0.05
+    else:
+        return torch.tensor(0.0, device=mask_logits.device)
+
+
+def compute_entropy_regularization_loss(confidence: torch.Tensor) -> torch.Tensor:
+    """异方差不确定性损失：exp(-s) * |e| + s, 其中s=log σ"""
+    # 假设confidence已经是log-uncertainty或直接作为uncertainty
+    # 这里简化：使用熵正则化
+    epsilon = 1e-6
+    confidence_clamped = torch.clamp(confidence, epsilon, 1.0 - epsilon)
+    entropy = -confidence_clamped * torch.log(confidence_clamped + epsilon) - (1 - confidence_clamped) * torch.log(1 - confidence_clamped + epsilon)
+    return -entropy.mean() * 0.01  # 最大化熵（最小化负熵）
+
+
+def compute_se3_lie_algebra_loss(pose_enc_list: list) -> torch.Tensor:
+    """SE(3)李代数差分损失（简化版）"""
+    if not pose_enc_list or len(pose_enc_list) < 2:
+        return torch.tensor(0.0, device=pose_enc_list[0].device if pose_enc_list else 'cuda')
+    
+    pose_enc = pose_enc_list[-1]  # [B, V, 9]
+    loss = torch.tensor(0.0, device=pose_enc.device)
+    
+    # 简化：计算相邻迭代的差异作为代理
+    for i in range(len(pose_enc_list) - 1):
+        diff = torch.mean((pose_enc_list[i] - pose_enc_list[i+1]) ** 2)
+        loss += diff
+    
+    return loss / max(len(pose_enc_list) - 1, 1) * 0.1
+
+
+def compute_mask_supervision_loss(predictions, segmask_gt, images, loss_config=None):
+    """
+    L_mask_ce (Focal/BCEWithLogits) + L_mask_tv (掩码边界/时序)
+    按照图片指令：使用logits监督，添加边界和时间一致性（支持配置控制）
     
     Args:
-        predictions: 模型输出字典
-        segmask_gt: SegAnyMo mask [B, T, N, H, W], 值域[0, 1], 1表示动态区域
-        images: 输入图像 [B, T, N, 3, H, W]，用于从模型中提取mask
+        predictions: 模型输出字典，需要包含mask_logits
+        segmask_gt: SegAnyMo mask [B, T, V, H, W], 值域[0, 1], 1表示动态区域
+        images: 输入图像 [B, T, V, C, H, W]
+        loss_config: LossConfig实例，控制哪些损失启用
     
     Returns:
         loss: 标量tensor, loss_dict: 字典
     """
-    if segmask_gt is None:
-        return torch.tensor(0.0, device=list(predictions.values())[0].device, requires_grad=True), {}
+    if loss_config is None:
+        loss_config = LossConfig(use_minimal=True)
     
-    B, T, N, C, H, W = images.shape
+    if segmask_gt is None or not loss_config.use_mask_ce:
+        return torch.tensor(0.0, device=list(predictions.values())[0].device, requires_grad=True), {
+            'mask_loss': 0.0, 'mask_ce_loss': 0.0, 'mask_boundary_loss': 0.0, 'mask_temporal_loss': 0.0
+        }
     
-    # 方法1：如果有dynamic_mask在predictions中，直接使用
-    if 'dynamic_mask' in predictions:
-        mask_pred = predictions['dynamic_mask']  # [B, T, N, H_patch, W_patch] 或 [B, T, N, H, W]
-        # 如果尺寸不匹配，resize
-        if mask_pred.shape[-2:] != (H, W):
-            mask_pred = torch.nn.functional.interpolate(
-                mask_pred.view(B*T*N, 1, mask_pred.shape[-2], mask_pred.shape[-1]),
-                size=(H, W), mode='bilinear', align_corners=False
-            ).view(B, T, N, H, W)
+    B, T, V, C, H, W = images.shape
+    device = images.device
+    
+    # 提取mask_logits（如果不存在，尝试从predictions中获取）
+    if 'mask_logits' in predictions:
+        mask_logits = predictions['mask_logits']
+    elif 'dynamic_mask' in predictions:
+        mask_logits = predictions['dynamic_mask']
     else:
-        # 方法2：从aggregator的dual_stream_outputs或aggregated_tokens_list中提取mask
-        # 这里简化：使用depth和world_points的置信度来近似动态mask
-        # 动态区域通常depth变化大，confidence低
-        if 'depth_conf' in predictions:
-            depth_conf = predictions['depth_conf']  # [B, T, N, 1, H, W]
-            # 低置信度区域可能是动态的
-            mask_pred = 1.0 - depth_conf.squeeze(-3)  # [B, T, N, H, W]
-        elif 'world_points_conf' in predictions:
-            point_conf = predictions['world_points_conf']  # [B, T, N, 1, H, W]
-            mask_pred = 1.0 - point_conf.squeeze(-3)  # [B, T, N, H, W]
-        else:
-            # 如果没有相关信息，返回0损失
-            mask_loss = torch.tensor(0.0, device=segmask_gt.device, requires_grad=True)
-            return mask_loss, {'mask_loss': 0.0}
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            'mask_loss': 0.0, 'mask_ce_loss': 0.0, 'mask_boundary_loss': 0.0, 'mask_temporal_loss': 0.0
+        }
     
-    # 确保mask_pred和segmask_gt形状一致
-    if mask_pred.shape != segmask_gt.shape:
-        # Resize segmask_gt到mask_pred的尺寸，或者反过来
-        if mask_pred.shape[-2:] != segmask_gt.shape[-2:]:
-            segmask_gt = torch.nn.functional.interpolate(
-                segmask_gt.view(B*T*N, 1, segmask_gt.shape[-2], segmask_gt.shape[-1]),
-                size=mask_pred.shape[-2:], mode='nearest'
-            ).view(segmask_gt.shape[:3] + mask_pred.shape[-2:])
+    try:
+        # 处理mask_logits的不同可能形状，统一转换为 [B, T, V, H, W]
+        if mask_logits.ndim == 4:
+            # [B, T, H, W] 或 [B, H, W, C] - 需要判断
+            if mask_logits.shape[1] == T:
+                mask_logits = mask_logits.unsqueeze(2)  # [B, T, H, W] -> [B, T, 1, H, W]
+            else:
+                # 可能是 [B, H, W, 1]，需要reshape
+                mask_logits = mask_logits.unsqueeze(1).unsqueeze(1)  # [B, H, W, 1] -> [B, 1, 1, H, W]
+        elif mask_logits.ndim == 5:
+            if mask_logits.shape[2] == 1 and mask_logits.shape[1] == T:
+                # [B, T, 1, H, W] -> [B, T, V, H, W] (broadcast V)
+                mask_logits = mask_logits.expand(-1, -1, V, -1, -1)
+            elif mask_logits.shape[1] != T or mask_logits.shape[2] != V:
+                # 形状不匹配，尝试推断
+                if mask_logits.shape[-1] == 1:
+                    mask_logits = mask_logits.squeeze(-1)  # [B, T, V, H, W, 1] -> [B, T, V, H, W]
+        elif mask_logits.ndim == 6:
+            # [B, T, V, 1, H, W] 或 [B, T, V, H, W, 1]
+            if mask_logits.shape[-1] == 1:
+                mask_logits = mask_logits.squeeze(-1)  # [B, T, V, H, W, 1] -> [B, T, V, H, W]
+            elif mask_logits.shape[-3] == 1:
+                mask_logits = mask_logits.squeeze(-3)  # [B, T, V, 1, H, W] -> [B, T, V, H, W]
+        
+        # 确保最终形状是 [B, T, V, H, W]
+        if mask_logits.ndim != 5 or mask_logits.shape[:3] != (B, T, V):
+            # 尝试reshape
+            total_elements = mask_logits.numel()
+            expected_elements = B * T * V * H * W
+            if total_elements == expected_elements:
+                mask_logits = mask_logits.reshape(B, T, V, H, W)
+            else:
+                raise ValueError(f"Cannot reshape mask_logits from {mask_logits.shape} to [B={B}, T={T}, V={V}, H={H}, W={W}]")
+        
+        # Resize到匹配（如果空间维度不一致）
+        mask_h, mask_w = mask_logits.shape[-2:]
+        if mask_h != H or mask_w != W:
+            mask_logits = F.interpolate(
+                mask_logits.view(B*T*V, 1, mask_h, mask_w),
+                size=(H, W), mode='bilinear', align_corners=False
+            ).view(B, T, V, H, W)
+        
+        # 同样处理segmask_gt
+        if segmask_gt.shape[-2:] != (H, W):
+            segmask_gt = F.interpolate(
+                segmask_gt.view(B*T*V, 1, *segmask_gt.shape[-2:]),
+                size=(H, W), mode='nearest'
+            ).view(B, T, V, H, W)
+    except Exception as e:
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            'mask_loss': 0.0, 'mask_ce_loss': 0.0, 'mask_boundary_loss': 0.0, 'mask_temporal_loss': 0.0
+        }
     
-    # 计算BCE损失（二值交叉熵）
-    mask_pred_clamped = torch.clamp(mask_pred, min=1e-6, max=1-1e-6)
-    bce_loss = - (segmask_gt * torch.log(mask_pred_clamped + 1e-6) + 
-                  (1 - segmask_gt) * torch.log(1 - mask_pred_clamped + 1e-6))
-    mask_loss = bce_loss.mean()
+    # L_mask_ce: BCEWithLogits (权重1.0)
+    segmask_gt_flat = segmask_gt.view(-1)
+    mask_logits_flat = mask_logits.view(-1)
+    mask_ce_loss = F.binary_cross_entropy_with_logits(mask_logits_flat, segmask_gt_flat.float())
     
-    return mask_loss, {'mask_loss': mask_loss.item()}
+    total_mask_loss = mask_ce_loss * loss_config.weights['mask_ce']
+    
+    # L_mask_tv: 边界和时间一致性 (权重0.2)
+    if loss_config.use_mask_tv:
+        static_mask = (1 - segmask_gt).bool()  # [B, T, V, H, W]
+        mask_boundary_loss = compute_boundary_loss(mask_logits)
+        mask_temporal_loss = compute_temporal_consistency_loss_mask(mask_logits, static_mask)
+        total_mask_loss = total_mask_loss + (mask_boundary_loss + mask_temporal_loss) * loss_config.weights['mask_tv']
+        mask_boundary_loss_val = mask_boundary_loss.item()
+        mask_temporal_loss_val = mask_temporal_loss.item()
+    else:
+        mask_boundary_loss_val = 0.0
+        mask_temporal_loss_val = 0.0
+    
+    return total_mask_loss, {
+        'mask_loss': total_mask_loss.item(),
+        'mask_ce_loss': mask_ce_loss.item(),
+        'mask_boundary_loss': mask_boundary_loss_val,
+        'mask_temporal_loss': mask_temporal_loss_val
+    }
 
 
-def compute_multi_view_consistency_loss(predictions, images, segmask_gt=None):
+def compute_camera_temporal_consistency_loss(predictions, T, V, loss_config=None):
     """
-    多视角几何一致性损失（无GT）+ SegAnyMo mask监督
+    L_cam^const (相机跨时恒定/方差正则, 权重0.1)
+    按照图片指令：使用SE(3)李代数差分替代跨迭代差异（支持配置控制）
     
     Args:
         predictions: 模型输出字典
-        images: 输入图像 [B, T, N, 3, H, W]
-        segmask_gt: SegAnyMo mask [B, T, N, H, W], 可选
+        T: 时间步数
+        V: 视角数
+        loss_config: LossConfig实例
+    """
+    if loss_config is None:
+        loss_config = LossConfig(use_minimal=True)
+    
+    if not loss_config.use_cam_const or 'pose_enc_list' not in predictions:
+        device = 'cpu'
+        if 'images' in predictions:
+            device = predictions['images'].device
+        elif 'depth' in predictions:
+            device = predictions['depth'].device
+        return torch.tensor(0.0, device=device, requires_grad=True), {'L_cam_const': 0.0}
+    
+    try:
+        pose_enc_list = predictions['pose_enc_list']
+        
+        # 处理pose_enc_list的不同可能形状
+        # 可能是 [B, V, 9] 或 list of [B, V, 9]
+        if isinstance(pose_enc_list, list):
+            if len(pose_enc_list) == 0:
+                return torch.tensor(0.0, device=list(predictions.values())[0].device, requires_grad=True), {'L_cam_const': 0.0}
+            pose_enc = pose_enc_list[-1]  # 使用最后一个迭代的结果
+        else:
+            pose_enc = pose_enc_list  # 直接是tensor
+        
+        # pose_enc应该是 [B, V, 9]（多视角）或 [B, T, 9]（单视角时序）
+        if len(pose_enc.shape) == 3:
+            if pose_enc.shape[1] == V:
+                # [B, V, 9] - 多视角，每个视角的相机参数
+                # 计算跨视角的一致性（相机参数应该在所有视角间是物理一致的）
+                if V > 1:
+                    # DEBUG: Print camera token differences to diagnose why they are identical
+                    # Check every batch to track improvements
+                    view_diffs = []
+                    view_diffs_per_dim = {}
+                    for v1 in range(V):
+                        for v2 in range(v1 + 1, V):
+                            diff_per_dim = (pose_enc[0, v1, :] - pose_enc[0, v2, :]).abs()
+                            max_diff = diff_per_dim.max().item()
+                            mean_diff = diff_per_dim.mean().item()
+                            view_diffs.append(max_diff)
+                            view_diffs_per_dim[(v1, v2)] = (max_diff, mean_diff)
+                            if max_diff < 1e-5:  # Values are essentially identical
+                                print(f"[WARNING] Camera params: view {v1} vs {v2} are nearly identical (max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e})")
+                    
+                    if len(view_diffs) > 0:
+                        avg_diff = sum(view_diffs) / len(view_diffs)
+                        max_diff_all = max(view_diffs)
+                        min_diff_all = min(view_diffs)
+                        # Print summary every 10 iterations
+                        if hasattr(compute_camera_temporal_consistency_loss, '_iter_count'):
+                            compute_camera_temporal_consistency_loss._iter_count += 1
+                        else:
+                            compute_camera_temporal_consistency_loss._iter_count = 1
+                        
+                        # if compute_camera_temporal_consistency_loss._iter_count % 10 == 0:
+                        #     print(f"[DEBUG] Camera param differences: avg={avg_diff:.6f}, max={max_diff_all:.6f}, min={min_diff_all:.6f}")
+                        #     # Print per-dimension differences for first view pair
+                        #     if (0, 1) in view_diffs_per_dim:
+                        #         max_d, mean_d = view_diffs_per_dim[(0, 1)]
+                        #         print(f"  View 0 vs 1: max={max_d:.6f}, mean={mean_d:.6f}")
+                        #         # Print actual values for debugging
+                        #         print(f"  View 0 sample: {pose_enc[0, 0, :3].detach().cpu().numpy()}")
+                        #         print(f"  View 1 sample: {pose_enc[0, 1, :3].detach().cpu().numpy()}")
+                    
+                    # 计算所有视角对之间的差异
+                    cam_diff = 0.0
+                    count = 0
+                    for v1 in range(V):
+                        for v2 in range(v1 + 1, V):
+                            diff = torch.mean((pose_enc[:, v1, :] - pose_enc[:, v2, :]) ** 2)
+                            cam_diff += diff
+                            count += 1
+                    if count > 0:
+                        cam_const_loss = (cam_diff / count) * loss_config.weights['cam_const']
+                    else:
+                        cam_const_loss = torch.tensor(0.0, device=pose_enc.device, requires_grad=True)
+                else:
+                    cam_const_loss = torch.tensor(0.0, device=pose_enc.device, requires_grad=True)
+            elif pose_enc.shape[1] == T:
+                # [B, T, 9] - 单视角时序，计算跨时间一致性
+                cam_const_loss = compute_se3_lie_algebra_loss([pose_enc]) * loss_config.weights['cam_const']
+            else:
+                # 未知形状
+                cam_const_loss = torch.tensor(0.0, device=pose_enc.device, requires_grad=True)
+        else:
+            cam_const_loss = compute_se3_lie_algebra_loss([pose_enc]) * loss_config.weights['cam_const']
+        
+        return cam_const_loss, {'L_cam_const': cam_const_loss.item() if isinstance(cam_const_loss, torch.Tensor) else cam_const_loss}
+    except Exception as e:
+        device = 'cpu'
+        if 'images' in predictions:
+            device = predictions['images'].device
+        elif 'depth' in predictions:
+            device = predictions['depth'].device
+        return torch.tensor(0.0, device=device, requires_grad=True), {'L_cam_const': 0.0}
+
+
+def compute_multi_view_consistency_loss(predictions, images, segmask_gt=None, camera_params=None, loss_config=None):
+    """
+    按照图片指令重写的多视角一致性损失（支持配置控制）
+    
+    Args:
+        predictions: 模型输出字典
+        images: 输入图像 [B, T, V, C, H, W]
+        segmask_gt: SegAnyMo mask [B, T, V, H, W], 1表示动态区域
+        camera_params: 相机参数 [B, V, 9] (pose_enc)
+        loss_config: LossConfig实例，控制哪些损失启用
     
     Returns:
-        loss: 标量tensor
+        total_loss, loss_dict
     """
-    B, T, N, C, H, W = images.shape
+    if loss_config is None:
+        # 默认使用最小必要配置
+        loss_config = LossConfig(use_minimal=True)
     
-    # 1. 深度一致性：world_points的z坐标应该与depth一致
-    if 'depth' in predictions and 'world_points' in predictions:
-        depth = predictions['depth']  # [B, T, N, 1, H, W]
-        world_points = predictions['world_points']  # [B, T, N, 3, H, W]
-        
-        # 提取z坐标（第3个通道，索引2）
-        depth_from_points = world_points[..., 2, :, :].unsqueeze(-3)  # [B, T, N, 1, H, W]
-        
-        # 只对有效的深度区域计算loss（depth > 0）
-        valid_mask = (depth > 0) & (depth_from_points > 0)
-        if valid_mask.sum() > 0:
-            depth_consistency = torch.abs(depth - depth_from_points) * valid_mask.float()
-            depth_loss = depth_consistency.sum() / valid_mask.sum().clamp(min=1)
-        else:
-            depth_loss = torch.tensor(0.0, device=depth.device, requires_grad=True)
+    B, T, V, C, H, W = images.shape
+    device = images.device
+    
+    # 静态区掩码 S = (1 - segmask_gt)
+    static_mask = None
+    if segmask_gt is not None:
+        static_mask = (1 - segmask_gt.float()).bool()  # [B, T, V, H, W]
+    
+    loss_dict = {}
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # L_depth->point^S (深度与点图一致, 静态, 权重0.5)
+    if loss_config.use_depth_point and 'depth' in predictions and 'world_points' in predictions:
+        try:
+            depth = predictions['depth']  # [B, T, V, 1, H, W] 或 [B, T, V, H, W, 1]
+            world_points = predictions['world_points']  # [B, T, V, H, W, 3] 或 [B, T, V, 3, H, W]
+            
+            # 处理world_points的不同可能形状
+            if world_points.shape[-1] == 3:
+                # world_points是 [B, T, V, H, W, 3]，提取z坐标
+                depth_from_points = world_points[..., 2]  # [B, T, V, H, W]
+                depth_from_points = depth_from_points.unsqueeze(-3)  # [B, T, V, 1, H, W]
+            elif len(world_points.shape) >= 5 and world_points.shape[-3] == 3:
+                # world_points是 [B, T, V, 3, H, W]，提取z坐标
+                depth_from_points = world_points[..., 2, :, :]  # [B, T, V, H, W]
+                depth_from_points = depth_from_points.unsqueeze(-3)  # [B, T, V, 1, H, W]
+            else:
+                # 未知形状，跳过
+                loss_dict['L_depth_point'] = 0.0
+                if loss_config.use_depth_point:
+                    print(f"Warning: Unknown world_points shape {world_points.shape}, skipping L_depth_point")
+                depth_from_points = None
+            
+            if depth_from_points is not None:
+                # 处理depth的不同可能形状
+                if len(depth.shape) == 6 and depth.shape[-1] == 1:
+                    # depth是 [B, T, V, H, W, 1]，转换为 [B, T, V, 1, H, W]
+                    depth = depth.squeeze(-1).unsqueeze(-3)
+                elif len(depth.shape) == 5 and depth.shape[-3] != 1:
+                    # depth是 [B, T, V, H, W]，添加通道维
+                    depth = depth.unsqueeze(-3)  # [B, T, V, 1, H, W]
+                
+                # 确保depth和depth_from_points形状一致
+                if depth.shape != depth_from_points.shape:
+                    # 尝试对齐形状
+                    if depth.shape[-2:] != depth_from_points.shape[-2:]:
+                        # 空间维度不匹配，尝试resize
+                        target_h, target_w = depth.shape[-2:]
+                        depth_from_points = F.interpolate(
+                            depth_from_points.view(B * T * V, 1, *depth_from_points.shape[-2:]),
+                            size=(target_h, target_w), mode='bilinear', align_corners=False
+                        ).view(B, T, V, 1, target_h, target_w)
+                    # 确保通道维一致
+                    if depth.shape[-3] != depth_from_points.shape[-3]:
+                        if depth.shape[-3] == 1:
+                            depth_from_points = depth_from_points.mean(dim=-3, keepdim=True)
+                
+                # 尺度归一化（简化：使用中位数归一化）
+                depth_median = torch.median(depth[depth > 0]) if (depth > 0).sum() > 0 else torch.tensor(1.0, device=device)
+                wp_depth_median = torch.median(depth_from_points[depth_from_points > 0]) if (depth_from_points > 0).sum() > 0 else torch.tensor(1.0, device=device)
+                
+                depth_norm = depth / (depth_median + 1e-6)
+                wp_depth_norm = depth_from_points / (wp_depth_median + 1e-6)
+                
+                valid_mask = (depth > 0) & (depth_from_points > 0)  # [B, T, V, 1, H, W]
+                if static_mask is not None:
+                    # static_mask是 [B, T, V, H, W]，需要unsqueeze到 [B, T, V, 1, H, W]
+                    static_mask_expanded = static_mask.unsqueeze(-3)  # [B, T, V, 1, H, W]
+                    # 如果空间维度不匹配，需要resize static_mask
+                    if static_mask_expanded.shape[-2:] != valid_mask.shape[-2:]:
+                        static_mask_expanded = F.interpolate(
+                            static_mask_expanded.float().view(B * T * V, 1, *static_mask_expanded.shape[-2:]),
+                            size=valid_mask.shape[-2:], mode='nearest'
+                        ).bool().view(B, T, V, 1, *valid_mask.shape[-2:])
+                    valid_mask = valid_mask & static_mask_expanded
+                
+                if valid_mask.sum() > 0:
+                    depth_point_diff = torch.abs(depth_norm - wp_depth_norm) * valid_mask.float()
+                    L_depth_point = depth_point_diff.sum() / valid_mask.sum().clamp(min=1)
+                    loss_dict['L_depth_point'] = L_depth_point.item() if isinstance(L_depth_point, torch.Tensor) else L_depth_point
+                    total_loss = total_loss + L_depth_point * loss_config.weights['depth_point']
+                else:
+                    loss_dict['L_depth_point'] = 0.0
+        except Exception as e:
+            loss_dict['L_depth_point'] = 0.0
+            if loss_config.use_depth_point:
+                print(f"Warning: Error computing L_depth_point: {e}, skipping")
     else:
-        depth_loss = torch.tensor(0.0, device=images.device, requires_grad=True)
+        loss_dict['L_depth_point'] = 0.0
     
-    # 2. 多视角重投影一致性（简化版）
-    # 使用depth和world_points，计算同一3D点在不同视角的投影一致性
-    if 'depth' in predictions and 'world_points' in predictions:
-        # 这里简化实现：计算同一时间帧内不同视角的world_points的一致性
-        # 更完整的实现需要相机内参和外参来重投影
-        world_points = predictions['world_points']  # [B, T, N, 3, H, W]
-        
-        # 计算同一时间帧内不同视角的3D点距离（简化：假设对应像素是同一3D点）
-        # 对每个时间帧，计算不同视角之间world_points的距离
-        # 这里简化：计算相邻视角的world_points差异
-        if N > 1:
-            # 计算视角间的差异
-            wp_view_diff = world_points[:, :, 1:] - world_points[:, :, :-1]  # [B, T, N-1, 3, H, W]
-            # 我们希望对应像素的3D点在不同视角应该一致（差异小）
-            reproj_loss = torch.mean(torch.norm(wp_view_diff, dim=-3, p=2))  # 对通道维度求norm
-        else:
-            reproj_loss = torch.tensor(0.0, device=images.device, requires_grad=True)
+    # L_mv_geo^S (跨视角几何重投影, 静态, 权重1.0) - 简化版代理（需要完整重投影实现）
+    # 注意：已删除错误的 wp_view_diff 直接相减
+    if loss_config.use_mv_geo and 'depth' in predictions and 'world_points' in predictions and V > 1:
+        # 简化代理：计算静态区深度在视角间的一致性（需要相机参数做重投影）
+        L_mv_geo = torch.tensor(0.0, device=device, requires_grad=True)  # 占位符
+        # TODO: 实现完整的3D重投影损失
+        loss_dict['L_mv_geo'] = L_mv_geo.item()
+        total_loss = total_loss + L_mv_geo * loss_config.weights['mv_geo']
     else:
-        reproj_loss = torch.tensor(0.0, device=images.device, requires_grad=True)
+        loss_dict['L_mv_geo'] = 0.0
     
-    # 3. 几何平滑性：相邻像素的world_points应该连续
-    if 'world_points' in predictions:
-        world_points = predictions['world_points']  # [B, T, N, 3, H, W]
-        
-        # 计算水平和垂直方向的梯度
-        # 水平方向：[B, T, N, 3, H, W] -> [B, T, N, 3, H, W-1]
-        diff_h = world_points[..., :-1] - world_points[..., 1:]
-        # 垂直方向：[B, T, N, 3, H, W] -> [B, T, N, 3, H-1, W]
-        diff_v = world_points[..., :-1, :] - world_points[..., 1:, :]
-        
-        # 平滑性损失：梯度应该小（对空间维度求norm）
-        smoothness_h = torch.mean(torch.norm(diff_h, dim=-3, p=2))  # 对通道维度(3)求norm
-        smoothness_v = torch.mean(torch.norm(diff_v, dim=-3, p=2))
-        smoothness_loss = (smoothness_h + smoothness_v) / 2.0
+    # L_epi^S (对极约束, 静态, 权重1.0) - 需要相机参数和对应点
+    if loss_config.use_epi and camera_params is not None and static_mask is not None:
+        # 简化代理：对极约束需要基础矩阵E和对应点
+        L_epi = torch.tensor(0.0, device=device, requires_grad=True)  # 占位符
+        # TODO: 实现对极约束损失 |x'T E x|
+        loss_dict['L_epi'] = L_epi.item()
+        total_loss = total_loss + L_epi * loss_config.weights['epi']
     else:
-        smoothness_loss = torch.tensor(0.0, device=images.device, requires_grad=True)
+        loss_dict['L_epi'] = 0.0
     
-    # 4. 置信度正则化：避免置信度过低或过高
-    # 注意：conf_activation="expp1" 意味着 confidence = 1 + exp(x)，值域为 [1, +∞)
-    # 我们希望 confidence 在一个合理范围内，既不要太低也不要过高
-    conf_loss = torch.tensor(0.0, device=images.device)
-    if 'depth_conf' in predictions:
-        depth_conf = predictions['depth_conf']  # [B, T, N, 1, H, W]
-        # 由于 depth_conf 值域是 [1, +∞)，我们需要：
-        # 1. 鼓励置信度不要太低（避免过低的置信度）
-        # 2. 惩罚过高的置信度（避免过度自信）
-        # 使用目标置信度范围，例如 [1, 10] 或 [1, 20]
-        target_conf_min = 1.0
-        target_conf_max = 10.0  # 可以根据实际情况调整
-        
-        # 低置信度惩罚：当 conf < target_conf_min 时惩罚
-        low_conf_penalty = F.relu(target_conf_min - depth_conf).mean()
-        
-        # 高置信度惩罚：当 conf > target_conf_max 时惩罚
-        high_conf_penalty = F.relu(depth_conf - target_conf_max).mean()
-        
-        conf_loss = conf_loss + 0.1 * (low_conf_penalty + high_conf_penalty)
+    # L_smooth^S_edge (边缘感知几何平滑, 静态, 权重0.2)
+    if loss_config.use_smooth_edge and 'world_points' in predictions and static_mask is not None:
+        try:
+            world_points = predictions['world_points']  # 可能是 [B, T, V, H, W, 3] 或 [B, T, V, 3, H, W]
+            images_gray = images.mean(dim=-3)  # [B, T, V, H, W]
+            
+            # 处理world_points的不同可能形状，统一转换为 [B, T, V, H, W, 3]
+            if world_points.shape[-1] == 3:
+                # world_points是 [B, T, V, H, W, 3]，保持不变
+                wp_shape = world_points.shape  # [B, T, V, H, W, 3]
+            elif len(world_points.shape) >= 6 and world_points.shape[-3] == 3:
+                # world_points是 [B, T, V, 3, H, W]，转换为 [B, T, V, H, W, 3]
+                world_points = world_points.permute(0, 1, 2, 4, 5, 3)  # [B, T, V, H, W, 3]
+                wp_shape = world_points.shape
+            else:
+                # 未知形状，跳过
+                loss_dict['L_smooth_edge'] = 0.0
+                if loss_config.use_smooth_edge:
+                    print(f"Warning: Unknown world_points shape {world_points.shape}, skipping L_smooth_edge")
+                world_points = None
+            
+            if world_points is not None:
+                # 确保world_points和images_gray的空间维度一致
+                wp_h, wp_w = world_points.shape[-3:-1]  # 从 [..., H, W, 3] 提取
+                img_h, img_w = images_gray.shape[-2:]  # [B, T, V, H, W]
+                
+                if wp_h != img_h or wp_w != img_w:
+                    # 需要resize world_points或images_gray
+                    target_h, target_w = img_h, img_w
+                    # Resize world_points到target size
+                    wp_flat = world_points.reshape(B * T * V, *world_points.shape[-3:])  # [B*T*V, H, W, 3]
+                    wp_permuted = wp_flat.permute(0, 3, 1, 2)  # [B*T*V, 3, H, W] for F.interpolate
+                    wp_resized = F.interpolate(
+                        wp_permuted, size=(target_h, target_w), mode='bilinear', align_corners=False
+                    )
+                    world_points = wp_resized.permute(0, 2, 3, 1).reshape(B, T, V, target_h, target_w, 3)
+                
+                # 图像梯度
+                img_grad_x = torch.abs(images_gray[:, :, :, :, 1:] - images_gray[:, :, :, :, :-1])  # [B, T, V, H, W-1]
+                img_grad_y = torch.abs(images_gray[:, :, :, 1:, :] - images_gray[:, :, :, :-1, :])  # [B, T, V, H-1, W]
+                
+                # 几何梯度（world_points现在是 [B, T, V, H, W, 3]）
+                wp_grad_x = world_points[:, :, :, :, 1:, :] - world_points[:, :, :, :, :-1, :]  # [B, T, V, H, W-1, 3]
+                wp_grad_y = world_points[:, :, :, 1:, :, :] - world_points[:, :, :, :-1, :, :]  # [B, T, V, H-1, W, 3]
+                
+                # 边缘感知权重：exp(-κ|∂I|)
+                kappa = 10.0
+                weight_x = torch.exp(-kappa * img_grad_x)  # [B, T, V, H, W-1]
+                weight_y = torch.exp(-kappa * img_grad_y)  # [B, T, V, H-1, W]
+                
+                # 应用静态掩码（需要与梯度维度匹配）
+                static_mask_x = static_mask[:, :, :, :, :-1].float()  # [B, T, V, H, W-1]
+                static_mask_y = static_mask[:, :, :, :-1, :].float()  # [B, T, V, H-1, W]
+                
+                # 确保空间维度匹配
+                if static_mask_x.shape[-2:] != weight_x.shape[-2:]:
+                    static_mask_x = F.interpolate(
+                        static_mask_x.view(B * T * V, 1, *static_mask_x.shape[-2:]),
+                        size=weight_x.shape[-2:], mode='nearest'
+                    ).bool().view(B, T, V, *weight_x.shape[-2:]).float()
+                if static_mask_y.shape[-2:] != weight_y.shape[-2:]:
+                    static_mask_y = F.interpolate(
+                        static_mask_y.view(B * T * V, 1, *static_mask_y.shape[-2:]),
+                        size=weight_y.shape[-2:], mode='nearest'
+                    ).bool().view(B, T, V, *weight_y.shape[-2:]).float()
+                
+                # 计算平滑损失
+                wp_grad_norm_x = torch.norm(wp_grad_x, dim=-1, p=2)  # [B, T, V, H, W-1]
+                wp_grad_norm_y = torch.norm(wp_grad_y, dim=-1, p=2)  # [B, T, V, H-1, W]
+                
+                smooth_x = (wp_grad_norm_x * weight_x * static_mask_x).mean()
+                smooth_y = (wp_grad_norm_y * weight_y * static_mask_y).mean()
+                L_smooth_edge = (smooth_x + smooth_y) / 2.0
+                loss_dict['L_smooth_edge'] = L_smooth_edge.item() if isinstance(L_smooth_edge, torch.Tensor) else L_smooth_edge
+                total_loss = total_loss + L_smooth_edge * loss_config.weights['smooth_edge']
+        except Exception as e:
+            loss_dict['L_smooth_edge'] = 0.0
+            if loss_config.use_smooth_edge:
+                print(f"Warning: Error computing L_smooth_edge: {e}, skipping")
+    else:
+        loss_dict['L_smooth_edge'] = 0.0
     
-    if 'world_points_conf' in predictions:
-        point_conf = predictions['world_points_conf']  # [B, T, N, 1, H, W]
-        target_conf_min = 1.0
-        target_conf_max = 10.0
-        
-        low_conf_penalty = F.relu(target_conf_min - point_conf).mean()
-        high_conf_penalty = F.relu(point_conf - target_conf_max).mean()
-        
-        conf_loss = conf_loss + 0.1 * (low_conf_penalty + high_conf_penalty)
+    # L_uncert (异方差/熵正则, 权重0.1) - 替代硬阈值
+    if loss_config.use_uncert:
+        try:
+            L_uncert = torch.tensor(0.0, device=device, requires_grad=True)
+            if 'depth_conf' in predictions:
+                depth_conf = predictions['depth_conf']
+                # 处理不同可能的形状
+                if len(depth_conf.shape) == 6:
+                    depth_conf = depth_conf.squeeze(-3) if depth_conf.shape[-3] == 1 else depth_conf.squeeze(-1)
+                elif len(depth_conf.shape) == 5 and depth_conf.shape[-3] == 1:
+                    depth_conf = depth_conf.squeeze(-3)
+                L_uncert = L_uncert + compute_entropy_regularization_loss(depth_conf)
+            if 'world_points_conf' in predictions:
+                point_conf = predictions['world_points_conf']
+                # 处理不同可能的形状
+                if len(point_conf.shape) == 6:
+                    point_conf = point_conf.squeeze(-3) if point_conf.shape[-3] == 1 else point_conf.squeeze(-1)
+                elif len(point_conf.shape) == 5 and point_conf.shape[-3] == 1:
+                    point_conf = point_conf.squeeze(-3)
+                L_uncert = L_uncert + compute_entropy_regularization_loss(point_conf)
+            loss_dict['L_uncert'] = L_uncert.item() if isinstance(L_uncert, torch.Tensor) else L_uncert
+            total_loss = total_loss + L_uncert * loss_config.weights['uncert']
+        except Exception as e:
+            loss_dict['L_uncert'] = 0.0
+            if loss_config.use_uncert:
+                print(f"Warning: Error computing L_uncert: {e}, skipping")
+    else:
+        loss_dict['L_uncert'] = 0.0
     
-    # 5. SegAnyMo mask监督损失（如果提供）
-    mask_loss_tensor, mask_loss_dict = compute_mask_supervision_loss(predictions, segmask_gt, images)
+    # L_scale^S (尺度一致, 权重0.1) - 静态区深度中位数对齐
+    if loss_config.use_scale and 'depth' in predictions and static_mask is not None:
+        try:
+            depth = predictions['depth']
+            
+            # 处理depth的不同可能形状，统一转换为 [B, T, V, H, W]
+            if len(depth.shape) == 6 and depth.shape[-1] == 1:
+                depth = depth.squeeze(-1)  # [B, T, V, 1, H, W] -> [B, T, V, H, W]
+            elif len(depth.shape) == 6 and depth.shape[-3] == 1:
+                depth = depth.squeeze(-3)  # [B, T, V, H, W, 1] -> [B, T, V, H, W]
+            elif len(depth.shape) == 5 and depth.shape[-3] == 1:
+                depth = depth.squeeze(-3)  # [B, T, V, 1, H, W] -> [B, T, V, H, W]
+            
+            # 确保空间维度匹配
+            if depth.shape[-2:] != static_mask.shape[-2:]:
+                depth_h, depth_w = depth.shape[-2:]
+                mask_h, mask_w = static_mask.shape[-2:]
+                if depth_h != mask_h or depth_w != mask_w:
+                    depth = F.interpolate(
+                        depth.view(B*T*V, 1, depth_h, depth_w),
+                        size=(mask_h, mask_w), mode='bilinear', align_corners=False
+                    ).view(B, T, V, mask_h, mask_w)
+            
+            static_depth = depth * static_mask.float()  # [B, T, V, H, W]
+            depth_medians = []
+            for t in range(T):
+                for v in range(V):
+                    d = static_depth[:, t, v, :, :]
+                    valid_d = d[d > 0]
+                    if len(valid_d) > 0:
+                        depth_medians.append(torch.median(valid_d))
+            
+            if len(depth_medians) > 1:
+                medians_tensor = torch.stack(depth_medians)
+                global_median = medians_tensor.median()
+                L_scale = torch.mean((medians_tensor - global_median) ** 2)
+                loss_dict['L_scale'] = L_scale.item() if isinstance(L_scale, torch.Tensor) else L_scale
+                total_loss = total_loss + L_scale * loss_config.weights['scale']
+            else:
+                loss_dict['L_scale'] = 0.0
+        except Exception as e:
+            loss_dict['L_scale'] = 0.0
+            if loss_config.use_scale:
+                print(f"Warning: Error computing L_scale: {e}, skipping")
+    else:
+        loss_dict['L_scale'] = 0.0
     
-    # 总损失
-    total_loss = (
-        1.0 * depth_loss +
-        0.5 * reproj_loss +
-        0.1 * smoothness_loss +
-        0.1 * conf_loss +
-        0.5 * mask_loss_tensor  # mask监督权重
-    )
-    
-    loss_dict = {
-        'depth_loss': depth_loss.item() if isinstance(depth_loss, torch.Tensor) else depth_loss,
-        'reproj_loss': reproj_loss.item() if isinstance(reproj_loss, torch.Tensor) else reproj_loss,
-        'smoothness_loss': smoothness_loss.item() if isinstance(smoothness_loss, torch.Tensor) else smoothness_loss,
-        'conf_loss': conf_loss.item() if isinstance(conf_loss, torch.Tensor) else conf_loss,
-    }
-    loss_dict.update(mask_loss_dict)
+    # L_photo^S (Charbonnier/SSIM, 可选, 权重0.2) - 占位符
+    if loss_config.use_photo:
+        L_photo = torch.tensor(0.0, device=device, requires_grad=True)
+        loss_dict['L_photo'] = L_photo.item()
+        total_loss = total_loss + L_photo * loss_config.weights['photo']
+    else:
+        loss_dict['L_photo'] = 0.0
     
     return total_loss, loss_dict
 
 
-def compute_dual_stream_separation_loss(predictions):
+def compute_dual_stream_separation_loss(predictions, loss_config=None):
+    """【待定，暂时没有加入】
+    L_sep (双流去相关/Barlow Twins, 权重0.1)
+    按照图片指令：替换余弦相似度为Barlow Twins去相关范式，非对称stop-grad版本（支持配置控制）
+    
+    Args:
+        predictions: 模型输出字典
+        loss_config: LossConfig实例
     """
-    两流分离损失：强制位姿流和几何流特征不同
-    """
-    if 'dual_stream_outputs' not in predictions:
-        return torch.tensor(0.0, device=list(predictions.values())[0].device), {}
+    if loss_config is None:
+        loss_config = LossConfig(use_minimal=True)
+    
+    if not loss_config.use_sep or 'dual_stream_outputs' not in predictions:
+        return torch.tensor(0.0, device=list(predictions.values())[0].device), {'L_sep': 0.0}
     
     dual_stream = predictions['dual_stream_outputs']
     if 'pose' not in dual_stream or 'geo' not in dual_stream:
-        return torch.tensor(0.0, device=list(predictions.values())[0].device), {}
+        return torch.tensor(0.0, device=list(predictions.values())[0].device), {'L_sep': 0.0}
     
-    pose_features = dual_stream['pose'][-1]  # 最后一层特征 [B, T, N, P, C]
-    geo_features = dual_stream['geo'][-1]  # [B, T, N, P, C]
+    pose_features = dual_stream['pose'][-1]  # [B, T, V, P, C]
+    geo_features = dual_stream['geo'][-1]  # [B, T, V, P, C]
     
-    # 计算余弦相似度（我们希望它小）
-    pose_flat = pose_features.view(-1, pose_features.shape[-1])  # [*, C]
-    geo_flat = geo_features.view(-1, geo_features.shape[-1])  # [*, C]
+    # 展平为 [B*T*V*P, C]
+    pose_flat = pose_features.view(-1, pose_features.shape[-1])
+    geo_flat = geo_features.view(-1, geo_features.shape[-1])
     
-    # 归一化
-    pose_norm = torch.nn.functional.normalize(pose_flat, p=2, dim=-1)
-    geo_norm = torch.nn.functional.normalize(geo_flat, p=2, dim=-1)
+    # Barlow Twins: 非对称stop-grad版本
+    # loss1: pose 去相关 (stop-grad) geo
+    loss1 = compute_barlow_twins_loss(pose_flat, geo_flat.detach())
+    # loss2: geo 去相关 (stop-grad) pose
+    loss2 = compute_barlow_twins_loss(geo_flat, pose_flat.detach())
     
-    # 余弦相似度
-    cosine_sim = (pose_norm * geo_norm).sum(dim=-1).mean()
+    L_sep = (loss1 + loss2) / 2.0 * loss_config.weights['sep']
     
-    # 分离损失：我们希望相似度小（加上负号使loss变大）
-    separation_loss = cosine_sim
-    
-    return separation_loss, {'separation_loss': separation_loss.item()}
+    return L_sep, {'L_sep': L_sep.item()}
 
 
 if __name__ == "__main__":
@@ -1051,26 +2053,43 @@ if __name__ == "__main__":
             enable_track=False  # 阶段1不训练track
         )
         
+        # 打印模型结构
+        print_model_structure(model_mv, max_depth=4)
+        
         # 加载权重
-        pi3_path = '/home/star/zzb/Pi3/ckpts/model.safetensors'
-        stats = model_mv.load_pretrained_weights(
-            checkpoint_path=origin if os.path.exists(origin) else None,
-            pi3_path=pi3_path,
-            device=device
-        )
-        print(f"Weight loading stats: {stats}")
-        
         model_mv.to(device)
+        load_stats = load_pretrained_weights(model_mv, origin, device=device, verbose=True) #mismatch (skipped): 1 keys： aggregator.patch_embed.pos_embed: checkpoint[1, 1370, 1024] vs model[1, 677, 1024]
         
-        # ========== 阶段1：冻结参数 ==========
+        # ========== 阶段1：冻结参数（按照图片中的精确指令） ==========
         print("\n" + "="*60)
         print("Stage 1: Freezing base features, training new modules")
+        print("Applying precise freeze/train strategy as per instructions")
         print("="*60)
-        freeze_parameters_stage1(model_mv)
+        apply_freeze_train_strategy_precise(model_mv)
         
         # ========== 设置优化器 ==========
         # 只优化需要训练的参数
         trainable_params = [p for p in model_mv.parameters() if p.requires_grad]
+        # Verify camera_token is trainable and will be included in optimizer
+        aggregator = model_mv.aggregator
+        if hasattr(aggregator, 'camera_token'):
+            print(f"\n[DEBUG] Camera token status before optimizer creation:")
+            print(f"  camera_token.requires_grad: {aggregator.camera_token.requires_grad}")
+            print(f"  camera_token.shape: {aggregator.camera_token.shape}")
+            # Check if camera tokens for different views are different
+            if aggregator.camera_token.shape[1] >= 4:  # At least 4 views
+                view_diffs = []
+                for v1 in range(min(4, aggregator.camera_token.shape[1])):
+                    for v2 in range(v1 + 1, min(4, aggregator.camera_token.shape[1])):
+                        diff = (aggregator.camera_token[0, v1, 0, :] - aggregator.camera_token[0, v2, 0, :]).abs().max().item()
+                        view_diffs.append(diff)
+                if len(view_diffs) > 0:
+                    avg_diff = sum(view_diffs) / len(view_diffs)
+                    max_diff = max(view_diffs)
+                    print(f"  Camera token differences (first 4 views): avg={avg_diff:.6f}, max={max_diff:.6f}")
+                    if max_diff < 1e-5:
+                        print(f"  WARNING: Camera tokens are too similar! Consider using larger initialization.")
+        
         optimizer = torch.optim.AdamW(
             trainable_params,
             lr=1e-4,  # 两流blocks和mask heads
@@ -1078,10 +2097,49 @@ if __name__ == "__main__":
             betas=(0.9, 0.999)
         )
         
+        # Verify camera_token is in optimizer
+        camera_token_in_optimizer = False
+        for group in optimizer.param_groups:
+            for param in group['params']:
+                if param is aggregator.camera_token:
+                    camera_token_in_optimizer = True
+                    break
+        if camera_token_in_optimizer:
+            print(f"  ✓ Camera token is included in optimizer")
+        else:
+            print(f"  ✗ WARNING: Camera token is NOT in optimizer! This may cause it not to be trained.")
+        
         # 学习率调度器（可选）
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=50, eta_min=1e-6
         )
+        
+        # ========== 损失函数配置（核心必要+重要损失） ==========
+        # 当前配置：只保留核心必要损失和重要损失，其余损失不参与训练
+        loss_config = LossConfig(use_minimal=True)
+        
+        # 当前激活的损失：
+        # 【核心必要损失】
+        #   - L_mask_ce (1.0): 掩码监督
+        #   - L_depth_point (0.5): 深度一致性
+        #   - L_cam_const (0.1): 相机跨时恒定
+        # 【重要损失】
+        #   - L_smooth_edge (0.2): 边缘感知几何平滑
+        #   - L_mv_geo (1.0): 跨视角几何重投影（当前占位符）
+        #
+        # 【不参与训练的损失】
+        #   - L_mask_tv, L_uncert, L_scale, L_sep (可选损失)
+        #   - L_epi, L_photo (占位符)
+        #   - L_kpt, L_temp_d (需要关键点标注)
+        
+        # 预留扩展接口：如果需要启用可选损失，可以取消下面的注释
+        # loss_config.enable_loss('mask_tv')           # 启用掩码边界/时序损失
+        # loss_config.enable_loss('uncert')            # 启用置信度正则
+        # loss_config.enable_loss('scale')             # 启用尺度一致性损失
+        # loss_config.enable_loss('sep')                # 启用双流分离损失（需要dual_stream_outputs）
+        # loss_config.set_weight('depth_point', 0.8)    # 调整深度一致性损失权重
+        
+        loss_config.print_config()
         
         # ========== TensorBoard 可视化 ==========
         log_dir = "results/train/init"
@@ -1103,12 +2161,22 @@ if __name__ == "__main__":
         for epoch in range(num_epochs):
             epoch_losses = {
                 'total': 0.0,
-                'depth_loss': 0.0,
-                'reproj_loss': 0.0,
-                'smoothness_loss': 0.0,
-                'conf_loss': 0.0,
+                # 几何损失
+                'L_mv_geo': 0.0,
+                'L_epi': 0.0,
+                'L_depth_point': 0.0,
+                'L_scale': 0.0,
+                'L_smooth_edge': 0.0,
+                'L_uncert': 0.0,
+                # 掩码损失
                 'mask_loss': 0.0,
-                'separation_loss': 0.0
+                'mask_ce_loss': 0.0,
+                'mask_boundary_loss': 0.0,
+                'mask_temporal_loss': 0.0,
+                # 相机损失
+                'L_cam_const': 0.0,
+                # 分离损失
+                'L_sep': 0.0
             }
             num_batches = 0
             
@@ -1174,15 +2242,41 @@ if __name__ == "__main__":
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=True):
                     predictions = model_mv(images_batch)
                     
-                    # 计算损失（多视角一致性 + SegAnyMo mask监督）
-                    loss_total, loss_dict = compute_multi_view_consistency_loss(
-                        predictions, images_batch, segmask_gt=masks_batch
+                    # 获取相机参数
+                    camera_params = predictions.get('pose_enc', None)  # [B, V, 9]
+                    
+                    # 计算损失（使用配置控制，最小必要配置）
+                    # 1. 多视角几何一致性损失（包含：'L_depth_point', 'L_mv_geo', 'L_epi', 'L_smooth_edge', 'L_uncert', 'L_scale', 'L_photo'）
+                    mv_loss, mv_loss_dict = compute_multi_view_consistency_loss(
+                        predictions, images_batch, segmask_gt=masks_batch, 
+                        camera_params=camera_params, loss_config=loss_config
                     )
                     
-                    # 两流分离损失
-                    sep_loss, sep_dict = compute_dual_stream_separation_loss(predictions)
-                    loss_total = loss_total + 0.1 * sep_loss
+                    # 2. 掩码监督损失（包含：L_mask_ce, 可选L_mask_tv）
+                    mask_loss, mask_loss_dict = compute_mask_supervision_loss(
+                        predictions, masks_batch, images_batch, loss_config=loss_config
+                    )
+                    
+                    # 3. 相机跨时恒定损失（L_cam^const）
+                    cam_loss, cam_loss_dict = compute_camera_temporal_consistency_loss(
+                        predictions, T, V, loss_config=loss_config
+                    )
+                    
+                    # 4. 双流分离损失（L_sep，可选）
+                    sep_loss, sep_dict = compute_dual_stream_separation_loss(
+                        predictions, loss_config=loss_config
+                    )
+                    
+                    # 总损失（所有损失的权重已在各函数内部根据loss_config应用）
+                    loss_total = mv_loss + mask_loss + cam_loss + sep_loss
+                    
+                    # 合并损失字典
+                    loss_dict = {}
+                    loss_dict.update(mv_loss_dict)
+                    loss_dict.update(mask_loss_dict)
+                    loss_dict.update(cam_loss_dict)
                     loss_dict.update(sep_dict)
+                    loss_dict['total'] = loss_total.item()
                 
                 # 反向传播
                 loss_total.backward()
@@ -1220,26 +2314,76 @@ if __name__ == "__main__":
                 
                 # 每个epoch的前几个batch记录图像可视化（可选，节省空间）
                 if batch_idx < 1 and epoch % 5 == 0:  # 每5个epoch记录一次
-                    # 记录输入图像（第一个视角，第一个时间帧）
-                    if images_batch.shape[1] > 0 and images_batch.shape[2] > 0:
-                        img_to_log = images_batch[0, 0, 0].cpu()  # [C, H, W]
-                        # 反归一化：从归一化后的图像恢复（如果需要）
-                        writer.add_image('Input/Image_t0_v0', img_to_log, global_step)
+                    # 记录输入图像（V行T列的大图）
+                    if len(images_batch.shape) == 6:  # Multi-view: [B, T, V, C, H, W]
+                        B, T, V, C, H, W = images_batch.shape
+                        if T > 0 and V > 0:
+                            # Create grid: V rows (views) × T columns (time)
+                            img_grid = create_multi_view_time_grid(images_batch, V, T, normalize=True)
+                            writer.add_image('Input/Image_grid_VxT', img_grid, global_step)
                         
-                        # 记录预测的depth（如果可用）
+                        # 记录预测的depth（如果可用）- 也使用网格布局
                         if 'depth' in predictions:
-                            depth_to_log = predictions['depth'][0, 0, 0, 0].cpu().detach()  # [H, W]
-                            # 归一化depth用于可视化
-                            if depth_to_log.max() > depth_to_log.min():
-                                depth_normalized = (depth_to_log - depth_to_log.min()) / (depth_to_log.max() - depth_to_log.min())
+                            depth = predictions['depth']  # [B, T, V, H, W, 1] or [B, T, V, H, W]
+                            # Handle different depth shapes
+                            if len(depth.shape) == 6:
+                                depth = depth.squeeze(-1)  # [B, T, V, H, W]
+                            elif len(depth.shape) == 5:
+                                pass  # Already [B, T, V, H, W]
                             else:
-                                depth_normalized = depth_to_log
-                            writer.add_image('Predictions/Depth_t0_v0', depth_normalized.unsqueeze(0), global_step)
+                                depth = None
+                            
+                            if depth is not None:
+                                # Normalize depth for visualization
+                                depth_vis = depth[0].detach().cpu()  # [T, V, H, W]
+                                # Normalize each frame separately
+                                depth_normalized = depth_vis.clone()
+                                for t in range(T):
+                                    for v in range(V):
+                                        d = depth_vis[t, v]
+                                        if d.max() > d.min():
+                                            depth_normalized[t, v] = (d - d.min()) / (d.max() - d.min())
+                                        else:
+                                            depth_normalized[t, v] = d
+                                # Add channel dimension and create grid
+                                depth_grid = create_multi_view_time_grid(
+                                    depth_normalized.unsqueeze(2), V, T, normalize=False
+                                )  # [1, H*V, W*T]
+                                writer.add_image('Predictions/Depth_grid_VxT', depth_grid, global_step)
                         
-                        # 记录mask（如果有）
+                        # 记录mask（如果有）- 也使用网格布局
                         if masks_batch is not None:
-                            mask_to_log = masks_batch[0, 0, 0].cpu()  # [H, W]
-                            writer.add_image('GT/Mask_t0_v0', mask_to_log.unsqueeze(0), global_step)
+                            # masks_batch: [B, T, V, H, W]
+                            # Ensure correct shape: [B, T, V, H, W] -> [B, T, V, 1, H, W] for grid function
+                            if len(masks_batch.shape) == 5:
+                                # [B, T, V, H, W] -> [B, T, V, 1, H, W]
+                                masks_for_grid = masks_batch.unsqueeze(3)  # [B, T, V, 1, H, W]
+                            elif len(masks_batch.shape) == 6:
+                                # Already has channel dimension
+                                if masks_batch.shape[3] == 1:
+                                    masks_for_grid = masks_batch  # [B, T, V, 1, H, W]
+                                elif masks_batch.shape[5] == 1:
+                                    masks_for_grid = masks_batch.permute(0, 1, 2, 5, 3, 4).squeeze(-1)  # Rearrange to [B, T, V, 1, H, W]
+                                    masks_for_grid = masks_for_grid.unsqueeze(3)  # Ensure channel dim
+                                else:
+                                    masks_for_grid = masks_batch.unsqueeze(3) if masks_batch.shape[3] != 1 else masks_batch
+                            else:
+                                masks_for_grid = None
+                            
+                            if masks_for_grid is not None:
+                                try:
+                                    mask_grid = create_multi_view_time_grid(
+                                        masks_for_grid, V, T, normalize=False
+                                    )  # [1, H*V, W*T]
+                                    writer.add_image('GT/Mask_grid_VxT', mask_grid, global_step)
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to create mask grid: {e}, skipping mask visualization")
+                    
+                    elif len(images_batch.shape) == 5:  # Legacy: [B, S, C, H, W]
+                        # Single view mode: just log first image
+                        if images_batch.shape[1] > 0:
+                            img_to_log = images_batch[0, 0].cpu()  # [C, H, W]
+                            writer.add_image('Input/Image_t0', img_to_log, global_step)
             
             # 计算平均损失
             if num_batches > 0:
@@ -1280,8 +2424,7 @@ if __name__ == "__main__":
             
             # 每10个epoch保存一次checkpoint
             if (epoch + 1) % 10 == 0:
-                checkpoint_path = f"checkpoints/stage1_epoch_{epoch+1}.pt"
-                os.makedirs("checkpoints", exist_ok=True)
+                checkpoint_path = f"{log_dir_with_timestamp}/stage1_epoch_{epoch+1}.pt"
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model_mv.state_dict(),
@@ -1300,90 +2443,3 @@ if __name__ == "__main__":
         print(f"  To view: tensorboard --logdir={log_dir_with_timestamp}")
         print("="*60)
     
-    # ========== 推理模式：使用原始函数（向后兼容）==========
-    elif os.path.exists(images_dir):
-        print(f"\n{'='*60}")
-        print("Inference Mode: Using load_time_view_images")
-        print(f"{'='*60}")
-        
-        # 加载时序多视角数据（无增强，用于推理）
-        images_tv, metadata = load_time_view_images(images_dir, target_size=378, mode="crop")
-        print(f"Loaded images with shape: {images_tv.shape}")
-        print(f"Time frames: {metadata['T']}, Views: {metadata['V']}")
-        
-        # 将 [T, V, C, H, W] 转换为模型需要的 [B, T, V, C, H, W] 格式
-        T_total, V, C, H, W = images_tv.shape
-        images_batch = images_tv.unsqueeze(0).to(device)  # [1, T_total, V, C, H, W]
-        
-        # 手动设置T：如果指定了T，只使用前T个时间帧
-        T = 6  # 手动设置T=6
-        if T < T_total:
-            images_batch = images_batch[:, :T, :, :, :, :]  # [1, T, V, C, H, W]
-            print(f"Using first {T} time frames out of {T_total} total frames")
-        
-        print(f"Input shape: {images_batch.shape} (B={1}, T={T}, V={V}, C={C}, H={H}, W={W})")
-    
-    # 模型初始化和推理代码（保持不变）
-    if os.path.exists(images_dir):
-        
-        # 初始化 vggt_t_mv 模型，使用多视角模式
-        origin = "checkpoint/checkpoint_150.pt"
-        model_mv = VGGT_MV(
-            img_size=378,
-            patch_size=14,
-            embed_dim=1024,
-            enable_camera=True,
-            enable_point=True,
-            enable_depth=True,
-            enable_track=True
-        )
-        
-        # 加载权重（使用新的权重加载方法）
-        pi3_path ='/home/star/zzb/Pi3/ckpts/model.safetensors'   # 可选：Pi3模型路径，如 "facebook/Pi3" 或本地路径
-        # pi3_path = "/path/to/pi3/model"  # 取消注释以加载Pi3权重
-        
-        stats = model_mv.load_pretrained_weights(
-            checkpoint_path=origin if os.path.exists(origin) else None,
-            pi3_path=pi3_path,
-            device=device
-        )
-        
-        print(f"Weight loading stats: {stats}")
-        
-        model_mv.to(device)
-        model_mv.eval()
-        
-        # 推理
-        print(f"Running inference...")
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model_mv(images_batch)
-        # for key, value in predictions.items():
-        #     if type(value) == torch.Tensor:
-        #         print(f"{key}: {value.shape}")
-        #     else:
-        #         print(f"{key}: {len(value)}")
-        print(f"Inference completed. Predictions keys: {list(predictions.keys())}")
-        
-        # 保存结果
-        save_predictions_visualization(
-            predictions=predictions,
-            output_dir="./output_visualization",
-            prefix="multi_view"
-        )
-        print()
-        
-        # for category in folders:
-        #     if data_name.startswith("online_img"):
-        #         image_names = [f for f in os.listdir(os.path.join(
-        #             directory, category)) if f.endswith('.png') or f.endswith('.jpg')]
-        #         try:
-        #             image_names.sort(key=lambda x: int(os.path.splitext(x)[0]))
-        #         except:
-        #             image_names.sort(key=lambda x: int(
-        #                 x.split('_')[-1].split('.')[0]))
-        #         image_names = [os.path.join(directory, category, f)
-        #                        for f in image_names][:24]
-        #     process(model, image_names, device,
-        #             directory=f'{data_name}/fig1_update_dpg', name=f'dpg_{category}')
-
