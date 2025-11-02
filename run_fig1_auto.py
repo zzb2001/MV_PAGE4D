@@ -98,12 +98,12 @@ def process(model, image_names, device, directory='image', name='vggt'):
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             aggregated_tokens_list, ps_idx = model.aggregator(images)
-            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]    #[1,24,9]
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(    #[1,24,3,4] [1,24,3,3]
                 pose_enc, images.shape[-2:])
-            depth_map, depth_conf = model.depth_head(
+            depth_map, depth_conf = model.depth_head(    #[1,24,294,518,1] [1,24,294,518]
                 aggregated_tokens_list, images, ps_idx)
-            point_map, point_conf = model.point_head(
+            point_map, point_conf = model.point_head(    #[1,24,294,518,3] [1,24,294,518] 
                 aggregated_tokens_list, images, ps_idx)
     depth_map = depth_map.squeeze(-1)
     world_points = backproject_depth_to_points_batch(
@@ -171,6 +171,6 @@ if __name__ == "__main__":
                 image_names = [os.path.join(directory, category, f)
                                for f in image_names][:24]
             process(model, image_names, device,
-                    directory=f'{data_name}/fig1_update_dpg', name=f'dpg_{category}')
+                    directory=f'{data_name}/fig1_update_dpg', name=f'dpg_{category}')   
             # process(model2, image_names, device,
             #         directory=f'{data_name}/fig1_update_vggt', name=f'vggt_{category}')

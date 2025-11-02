@@ -9,13 +9,16 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from vggt_t_mv.models.aggregator import Aggregator
 from vggt_t_mv.heads.camera_head import CameraHead
 from vggt_t_mv.heads.dpt_head import DPTHead
 from vggt_t_mv.heads.track_head import TrackHead
-from vggt_t_mv.utils.weight_loading import load_checkpoint_weights, load_pi3_weights, adapt_weights_dimension
+from vggt_t_mv.utils.weight_loading import (
+    load_checkpoint_weights, load_pi3_weights, adapt_weights_dimension,
+    load_weights_three_stage
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,20 +77,32 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list)
+                # 根据架构图4.1: 输入来自位姿流
+                pose_enc_list = self.camera_head(
+                    aggregated_tokens_list, 
+                    dual_stream_outputs=dual_stream_outputs
+                )
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
                 
             if self.depth_head is not None:
+                # 根据架构图4.2: 输入来自几何流的patch tokens
                 depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, 
+                    images=images, 
+                    patch_start_idx=patch_start_idx,
+                    dual_stream_outputs=dual_stream_outputs
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
             if self.point_head is not None:
+                # 根据架构图4.2: 输入来自几何流的patch tokens
                 pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, 
+                    images=images, 
+                    patch_start_idx=patch_start_idx,
+                    dual_stream_outputs=dual_stream_outputs
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
@@ -110,28 +125,54 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         return predictions
     
-    def load_pretrained_weights(self, checkpoint_path: str, pi3_path: Optional[str] = None, 
-                                device: str = 'cpu') -> Dict[str, int]:
+    def load_pretrained_weights(self, checkpoint_path: Optional[str] = None, 
+                                pi3_path: Optional[str] = None, 
+                                device: str = 'cpu',
+                                page4d_mid_layers: Optional[List[int]] = None,
+                                use_three_stage: bool = True) -> Dict[str, int]:
         """
-        加载预训练权重：从 checkpoint_150.pt 和可选的 Pi3 模型
+        加载预训练权重：三阶段加载策略
         
         Args:
-            checkpoint_path: checkpoint_150.pt 文件路径
+            checkpoint_path: PAGE-4D checkpoint_150.pt 文件路径（可选）
             pi3_path: Pi3 模型路径（HuggingFace路径或本地路径），可选
             device: 加载设备
-            
+            page4d_mid_layers: PAGE-4D 要覆盖的中段层索引（如 [8, 9, 10, 11, 12, 13, 14, 15]）
+                如果为 None，默认覆盖层 8-15
+            use_three_stage: 是否使用三阶段加载策略（推荐）
+                - True: 三阶段（先Pi3，再PAGE-4D覆盖，最后初始化新增模块）
+                - False: 向后兼容的旧方法
+        
         Returns:
-            dict: 加载统计信息 {'checkpoint_loaded': N, 'pi3_loaded': M, 'missing': K}
+            dict: 加载统计信息
+        """
+        if use_three_stage:
+            # 使用新的三阶段加载策略
+            stats = load_weights_three_stage(
+                pi3_path=pi3_path,
+                checkpoint_path=checkpoint_path,
+                model=self,
+                device=device,
+                page4d_mid_layers=page4d_mid_layers
+            )
+            return stats
+        else:
+            # 向后兼容的旧方法
+            return self._load_pretrained_weights_legacy(checkpoint_path, pi3_path, device)
+    
+    def _load_pretrained_weights_legacy(self, checkpoint_path: Optional[str] = None,
+                                       pi3_path: Optional[str] = None,
+                                       device: str = 'cpu') -> Dict[str, int]:
+        """
+        向后兼容的旧权重加载方法
         """
         stats = {'checkpoint_loaded': 0, 'pi3_loaded': 0, 'missing': 0, 'unexpected': 0}
         
-        # 1. 从 checkpoint_150.pt 加载权重（加载到整个模型，包括 aggregator 和所有 heads）
+        # 1. 从 checkpoint_150.pt 加载权重
         if checkpoint_path:
             try:
                 logger.info(f"Loading checkpoint from {checkpoint_path}...")
                 
-                # 加载 checkpoint
-                import os
                 if checkpoint_path.endswith('.safetensors'):
                     from safetensors.torch import load_file as safetensors_load
                     checkpoint_dict = safetensors_load(checkpoint_path, device=device)
@@ -139,65 +180,36 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
                     checkpoint_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
                 
-                # 获取模型的所有权重键
                 model_dict = self.state_dict()
                 mapped_dict = {}
-                skipped_keys = []
                 
-                # 匹配权重：检查键名和形状
                 for key, param in checkpoint_dict.items():
                     if key in model_dict:
                         if model_dict[key].shape == param.shape:
                             mapped_dict[key] = param
-                        else:
-                            logger.warning(f"Shape mismatch for {key}: checkpoint {param.shape} vs model {model_dict[key].shape}")
-                            skipped_keys.append(key)
-                    else:
-                        skipped_keys.append(key)
                 
-                # 加载权重到整个模型
                 missing_keys, unexpected_keys = self.load_state_dict(mapped_dict, strict=False)
-                
                 stats['checkpoint_loaded'] = len(mapped_dict)
                 stats['missing'] = len(missing_keys)
                 stats['unexpected'] = len(unexpected_keys)
                 
-                logger.info(f"Loaded {stats['checkpoint_loaded']} parameters from checkpoint")
-                logger.info(f"  - Missing keys: {stats['missing']}")
-                logger.info(f"  - Unexpected keys: {stats['unexpected']}")
-                logger.info(f"  - Skipped keys (not in model): {len(skipped_keys)}")
-                
-                # 打印一些示例的加载情况
-                if mapped_dict:
-                    logger.info(f"Sample loaded keys: {list(mapped_dict.keys())[:5]}")
-                if skipped_keys:
-                    logger.debug(f"Sample skipped keys: {list(skipped_keys)[:5]}")
-                    
             except Exception as e:
                 logger.error(f"Failed to load checkpoint: {e}", exc_info=True)
         
-        # 2. 从 Pi3 加载多视角聚合权重（只加载到 aggregator）
+        # 2. 从 Pi3 加载权重
         if pi3_path:
             try:
-                logger.info(f"Loading Pi3 weights from {pi3_path}...")
                 pi3_dict, missing_pi3, unexpected_pi3 = load_pi3_weights(
                     pi3_path, self.aggregator, device=device
                 )
                 stats['pi3_loaded'] = len(pi3_dict)
-                logger.info(f"Loaded {stats['pi3_loaded']} parameters from Pi3")
-                if missing_pi3:
-                    logger.info(f"  - Pi3 missing keys: {len(missing_pi3)}")
-                if unexpected_pi3:
-                    logger.info(f"  - Pi3 unexpected keys: {len(unexpected_pi3)}")
             except Exception as e:
                 logger.warning(f"Failed to load Pi3 weights: {e}", exc_info=True)
         
-        # 3. 如果启用两流架构，复制权重到 pose 和 geo blocks
+        # 3. 初始化两流架构
         if self.aggregator.enable_dual_stream:
-            logger.info("Initializing dual-stream blocks with copied weights...")
-            # 从主 blocks 复制权重到两流 blocks（作为初始化）
+            logger.info("Initializing dual-stream blocks...")
             for i in range(len(self.aggregator.frame_blocks)):
-                # Frame blocks -> Pose/Geo frame blocks
                 self._copy_block_weights(
                     self.aggregator.frame_blocks[i],
                     self.aggregator.pose_frame_blocks[i]
@@ -206,9 +218,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     self.aggregator.frame_blocks[i],
                     self.aggregator.geo_frame_blocks[i]
                 )
-            
             for i in range(len(self.aggregator.global_blocks)):
-                # Global blocks -> Pose/Geo global blocks
                 self._copy_block_weights(
                     self.aggregator.global_blocks[i],
                     self.aggregator.pose_global_blocks[i]
@@ -217,7 +227,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     self.aggregator.global_blocks[i],
                     self.aggregator.geo_global_blocks[i]
                 )
-            logger.info("Dual-stream blocks initialized")
         
         return stats
     

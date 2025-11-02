@@ -20,6 +20,7 @@ from vggt_t_mv.layers.block import SpatialMaskHead_IMP as SpatialMaskHead_IMP
 from vggt_t_mv.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt_t_mv.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 from vggt_t_mv.models.mask_utils import *
+from vggt_t_mv.models.dynamic_mask_head import DynamicMaskHead
 from vggt_t_mv.utils.epipolar_utils import compute_epipolar_bias, compute_plucker_angle_weight
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
-        enable_dual_stream=False,  # 启用两流架构（位姿流 vs 几何流）
+        enable_dual_stream=True,  # 启用两流架构（位姿流 vs 几何流）
         enable_sparse_global=False,  # 启用 Sparse Global-SA
         sparse_global_layers=None,  # Sparse Global-SA 应用的层索引，如 [23, 24]
         sparse_strategy="landmark",  # "landmark", "block_dilated", "memory_bank"
@@ -81,11 +82,15 @@ class Aggregator(nn.Module):
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
+        # 参数来源：② Pi3（若Pi3已有相对PE则复用），否则③ 新增（初始化）
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
         
-        # Frame blocks (used for Time-SA in multi-view mode, frame attention in single-view mode)
-        self.frame_blocks = nn.ModuleList(
+        # ===== 核心注意力块 =====
+        # time_blocks: Time-SA，同视角跨时注意，Lmid层若干
+        # 参数来源：① PAGE-4D（checkpoint_150.pt）作为初始化，或② Pi3 的 frame_blocks 迁移
+        # 说明：用于单视角内的时序建模
+        self.time_blocks = nn.ModuleList(
             [ block_fn(
                     dim=embed_dim,
                     num_heads=num_heads,
@@ -98,8 +103,10 @@ class Aggregator(nn.Module):
                     rope=self.rope,
                 ) for _ in range(depth)])
         
-        # Global blocks (used for View-SA in multi-view mode, global attention in single-view mode)
-        self.global_blocks = nn.ModuleList(
+        # view_blocks: View-SA，同步视角跨视注意，Lmid层若干
+        # 参数来源：② Pi3 的 global_blocks（跨图注意）拷权作为初始化
+        # 说明：结构保持Q/K/V/Proj一致；位置/掩码逻辑改为"按视角聚合"
+        self.view_blocks = nn.ModuleList(
             [block_fn(
                     dim=embed_dim,
                     num_heads=num_heads,
@@ -112,68 +119,114 @@ class Aggregator(nn.Module):
                     rope=self.rope,
                 ) for _ in range(depth)])
         
-        # View blocks (for View-SA in multi-view mode, alias to global_blocks)
-        # Time blocks (for Time-SA in multi-view mode, alias to frame_blocks)
-        # These are aliases for backward compatibility and weight loading
-        self.view_blocks = self.global_blocks  # View-SA uses global_blocks (from Pi3 Global-Attention)
-        self.time_blocks = self.frame_blocks   # Time-SA uses frame_blocks (from VGGT Frame-Attention)
+        # 向后兼容：frame_blocks 和 global_blocks 作为别名
+        # 用于单视角模式（backward compatible）
+        self.frame_blocks = self.time_blocks  # 单视角模式使用 time_blocks
+        self.global_blocks = self.view_blocks  # 单视角模式使用 view_blocks
         
         self.temporal_list1 = [0, 1, 2, 3, 4, 5, 6, 7]
         self.temporal_list1_mask = [7]
         self.temporal_list2 = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 
+        # spatial_mask_head: 动态掩码小头（向后兼容，保留旧实现）
+        # 参数来源：① PAGE-4D（checkpoint_150.pt）可直接load（结构相同/相近）
         self.spatial_mask_head = SpatialMaskHead_IMP(embed_dim)
         
-        # 两流架构：位姿流 vs 几何流
+        # dynamic_mask_head: 新的动态掩码小头（根据架构图2）
+        # 参数来源：① PAGE-4D（checkpoint_150.pt 优先），不匹配则新增结构初始化
+        self.dynamic_mask_head = DynamicMaskHead(embed_dim=embed_dim, use_gating=False)
+        
+        # ===== 两流架构：enable_dual_stream =====
+        # 修改1: 优化两流架构参数和内存使用
+        # - 限制两流在L_mid的6-10层（索引5-9，0-based）
+        # - 其他层共享权重，只应用不同的logits偏置
+        # - 共享Q/K/V/O线性层，两流只保留最小门控参数λ
         self.enable_dual_stream = enable_dual_stream
+        self.dual_stream_layers = [6, 7, 8, 9, 10] if enable_dual_stream else []  # L_mid的敏感中间层
+        
         if enable_dual_stream:
-            # 位姿流：用于相机位姿估计（抑制动态区域）
-            self.pose_frame_blocks = nn.ModuleList([
-                deepcopy(block_fn(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
-                    init_values=init_values, qk_norm=qk_norm, rope=self.rope,
-                )) for _ in range(depth)])
-            self.pose_global_blocks = nn.ModuleList([
-                deepcopy(block_fn(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
-                    init_values=init_values, qk_norm=qk_norm, rope=self.rope,
-                )) for _ in range(depth)])
+            # 修改1: 只创建L_mid层（6-10）的独立blocks，其他层共享
+            dual_stream_depth = len(self.dual_stream_layers)
             
-            # 几何流：用于点云/深度估计（放大动态区域）
-            self.geo_frame_blocks = nn.ModuleList([
+            # 位姿流：只创建L_mid层的独立blocks
+            self.pose_time_blocks = nn.ModuleList([
                 deepcopy(block_fn(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
                     init_values=init_values, qk_norm=qk_norm, rope=self.rope,
-                )) for _ in range(depth)])
-            self.geo_global_blocks = nn.ModuleList([
+                )) for _ in range(dual_stream_depth)])
+            self.pose_view_blocks = nn.ModuleList([
                 deepcopy(block_fn(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
                     init_values=init_values, qk_norm=qk_norm, rope=self.rope,
-                )) for _ in range(depth)])
+                )) for _ in range(dual_stream_depth)])
             
-            # 动态掩码偏置参数（可学习）
+            # 几何流：只创建L_mid层的独立blocks
+            self.geo_time_blocks = nn.ModuleList([
+                deepcopy(block_fn(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
+                    init_values=init_values, qk_norm=qk_norm, rope=self.rope,
+                )) for _ in range(dual_stream_depth)])
+            self.geo_view_blocks = nn.ModuleList([
+                deepcopy(block_fn(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
+                    init_values=init_values, qk_norm=qk_norm, rope=self.rope,
+                )) for _ in range(dual_stream_depth)])
+            
+            # 向后兼容：保留旧名称作为别名
+            self.pose_frame_blocks = self.pose_time_blocks
+            self.pose_global_blocks = self.pose_view_blocks
+            self.geo_frame_blocks = self.geo_time_blocks
+            self.geo_global_blocks = self.geo_view_blocks
+            
+            # 修改1 & 3: 动态掩码偏置参数（可学习标量，最小门控参数）
+            # 初始化λ_*为0，clamp到[-4, 4]
             # λ_pose: 位姿支路的负偏置强度（抑制动态）
             # λ_geo: 几何支路的正偏置强度（放大动态）
-            self.lambda_pose_logit = nn.Parameter(torch.tensor(0.1).log())  # 初始值 0.1
-            self.lambda_geo_logit = nn.Parameter(torch.tensor(0.1).log())   # 初始值 0.1
+            # λ_pose_t: Time-SA 的位姿支路偏置
+            # λ_geo_t: Time-SA 的几何支路偏置
+            self.lambda_pose_logit = nn.Parameter(torch.tensor(0.0))  # View-SA 位姿流
+            self.lambda_geo_logit = nn.Parameter(torch.tensor(0.0))   # View-SA 几何流
+            self.lambda_pose_t_logit = nn.Parameter(torch.tensor(0.0))  # Time-SA 位姿流
+            self.lambda_geo_t_logit = nn.Parameter(torch.tensor(0.0))   # Time-SA 几何流
             self.lambda_clamp_value = 4.0  # clamp 到 [-4, 4]
+            
+            # 修改1: Top-k稀疏化参数（用于View-SA/Time-SA）
+            self.topk_sparsity_ratio = 0.4  # 过滤30-50%的tokens（使用0.4即40%）
+            self.use_topk_sparsity = True  # 启用Top-k稀疏化
         
-        # Sparse Global-SA 配置
+        # ===== Sparse Global-SA: enable_sparse_global =====
+        # strategy="landmark" | "dilated" | "memory_bank"
+        # 参数来源：③ 新增（初始化）；但Q/K/V/Proj可从② Pi3 global_blocks拷权
+        # 说明：注意力稀疏图是逻辑层，不影响线性层权重可复用
         self.enable_sparse_global = enable_sparse_global
         self.sparse_global_layers = sparse_global_layers if sparse_global_layers is not None else []
         self.sparse_strategy = sparse_strategy
-        if enable_sparse_global:
+        
+        # global_sparse_blocks: 1-2层，可选
+        sparse_global_depth = len(self.sparse_global_layers) if self.sparse_global_layers else 0
+        if enable_sparse_global and sparse_global_depth > 0:
+            self.global_sparse_blocks = nn.ModuleList([
+                block_fn(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias, proj_bias=proj_bias, ffn_bias=ffn_bias,
+                    init_values=init_values, qk_norm=qk_norm, rope=self.rope,
+                ) for _ in range(sparse_global_depth)])
+            
             if sparse_strategy == "landmark":
                 self.landmark_k = 64  # 每个 (t, v) 选择的 landmark tokens 数量
-            elif sparse_strategy == "block_dilated":
+            elif sparse_strategy == "dilated":
                 self.dilated_levels = [1, 2, 4]  # 扩张级别
             elif sparse_strategy == "memory_bank":
+                # memory_tokens（仅strategy="memory_bank"启用）
+                # 参数来源：③ 新增（初始化）
                 self.memory_tokens = nn.Parameter(torch.randn(1, 32, embed_dim))  # 跨窗 memory tokens
                 nn.init.normal_(self.memory_tokens, std=1e-6)
+        else:
+            self.global_sparse_blocks = None
         
         # 极线/几何先验
         self.enable_epipolar_prior = enable_epipolar_prior
@@ -198,6 +251,7 @@ class Aggregator(nn.Module):
 
         # The patch tokens start after the camera and register tokens
         self.patch_start_idx = 1 + num_register_tokens
+        self.num_register_tokens = num_register_tokens  # 保存用于掩码处理
 
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
@@ -305,7 +359,7 @@ class Aggregator(nn.Module):
             _image_ = Image.fromarray((_image_.cpu().view(H,W,3).clamp(0, 1) * 255).byte().numpy()).resize((400,400), resample=Image.BILINEAR)  
             _image_.save("image-last.png")
 
-        patch_tokens = self.patch_embed(images)
+        patch_tokens = self.patch_embed(images) #'x_norm_cls_token', 'x_norm_patchtokens', 'x_norm_mask_token','x_norm_token'
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
         _, P, C = patch_tokens.shape
@@ -341,12 +395,14 @@ class Aggregator(nn.Module):
             P = P_total
             
             # Position encoding
+            # 修改5: 只使用空间位置编码，不使用view-ID PE，保持View Permutation Equivariance
             if self.rope is not None:
                 pos_patch = self.position_getter(B * T * N, H // self.patch_size, W // self.patch_size, device=images.device)
                 pos_patch = pos_patch.view(B, T, N, P - self.patch_start_idx, 2)
                 pos_special = torch.zeros(B, T, N, self.patch_start_idx, 2, device=images.device, dtype=pos_patch.dtype)
                 pos = torch.cat([pos_special, pos_patch], dim=3)  # [B, T, N, P, 2]
                 pos = pos + 1  # Offset by 1
+                # 修改5: 确保不使用view-ID相关的PE，只使用空间2D位置编码
             else:
                 pos = None
                 
@@ -401,33 +457,70 @@ class Aggregator(nn.Module):
                                      num_block in self.sparse_global_layers)
                 
                 for attn_type in effective_aa_order:
-                    if self.enable_dual_stream:
+                    # 修改1: 判断当前层是否在两流架构的L_mid层中
+                    # 对于View-SA: 使用view_idx；对于Time-SA: 使用time_idx
+                    if attn_type == "view":
+                        current_layer_idx = view_idx
+                    else:  # time
+                        current_layer_idx = time_idx
+                    
+                    use_dual_stream_at_layer = (self.enable_dual_stream and 
+                                               current_layer_idx in self.dual_stream_layers)
+                    
+                    if use_dual_stream_at_layer:
+                        # 修改1: 只在L_mid层使用独立的两流blocks
+                        # 计算在dual_stream_layers中的索引
+                        dual_stream_layer_idx = self.dual_stream_layers.index(current_layer_idx) if current_layer_idx in self.dual_stream_layers else 0
+                        
                         # 两流架构：并行处理位姿流和几何流
+                        # 修改1: 传递dual_stream_layer_idx（0-4）而不是原始的view_idx/time_idx
                         tokens_pose, tokens_geo = self._process_dual_stream_attention(
                             tokens, B, T, N, P, C, 
-                            block_idx=view_idx if attn_type == "view" else time_idx,
-                            pos=pos, attn_type=attn_type
+                            block_idx=dual_stream_layer_idx,  # 使用dual_stream_layer_idx（0-4）
+                            pos=pos, attn_type=attn_type,
+                            dual_stream_layer_idx=dual_stream_layer_idx
                         )
                         
+                        # 修改1: _process_dual_stream_attention已经处理了tokens，直接使用结果
+                        # 不需要再次调用_process_view_attention或_process_time_attention
                         if attn_type == "view":
-                            # View-SA 的两流处理
-                            _, view_idx, pose_inter = self._process_view_attention(
-                                tokens_pose, B, T, N, P, C, view_idx, pos=pos, is_multi_view=True)
-                            _, _, geo_inter = self._process_view_attention(
-                                tokens_geo, B, T, N, P, C, view_idx, pos=pos, is_multi_view=True)
+                            # View-SA 的两流处理已完成，直接使用结果
+                            pose_inter = [tokens_pose]  # 将结果作为中间输出
+                            geo_inter = [tokens_geo]
+                            view_idx += 1  # 递增view_idx以便后续层使用
                             pose_intermediates.extend(pose_inter)
                             geo_intermediates.extend(geo_inter)
                             global_intermediates.extend(geo_inter)  # 几何流用于全局输出
                             tokens = tokens_geo  # 使用几何流作为主 tokens
                         else:  # time
-                            _, time_idx, pose_inter = self._process_time_attention(
-                                tokens_pose, B, T, N, P, C, time_idx, pos=pos, is_multi_view=True)
-                            _, _, geo_inter = self._process_time_attention(
-                                tokens_geo, B, T, N, P, C, time_idx, pos=pos, is_multi_view=True)
+                            # Time-SA 的两流处理已完成，直接使用结果
+                            pose_inter = [tokens_pose]  # 将结果作为中间输出
+                            geo_inter = [tokens_geo]
+                            time_idx += 1  # 递增time_idx以便后续层使用
                             pose_intermediates.extend(pose_inter)
                             geo_intermediates.extend(geo_inter)
                             frame_intermediates.extend(geo_inter)
                             tokens = tokens_geo
+                    elif self.enable_dual_stream:
+                        # 修改1: 不在L_mid层的其他层，共享权重，只应用不同的logits偏置
+                        # 使用共享的view_blocks/time_blocks，但通过mask偏置区分两流
+                        # 这里暂时只使用共享blocks，偏置在Block内部应用
+                        if attn_type == "view":
+                            tokens, view_idx, intermediates = self._process_view_attention(
+                                tokens, B, T, N, P, C, view_idx, pos=pos, is_multi_view=True,
+                                dynamic_mask=None  # TODO: 传递mask以应用偏置
+                            )
+                            global_intermediates.extend(intermediates)
+                            pose_intermediates.extend(intermediates)  # 共享输出
+                            geo_intermediates.extend(intermediates)  # 共享输出
+                        elif attn_type == "time":
+                            tokens, time_idx, intermediates = self._process_time_attention(
+                                tokens, B, T, N, P, C, time_idx, pos=pos, is_multi_view=True,
+                                dynamic_mask=None  # TODO: 传递mask以应用偏置
+                            )
+                            frame_intermediates.extend(intermediates)
+                            pose_intermediates.extend(intermediates)  # 共享输出
+                            geo_intermediates.extend(intermediates)  # 共享输出
                     else:
                         # 标准单流处理
                         if attn_type == "view":
@@ -458,9 +551,12 @@ class Aggregator(nn.Module):
                             frame_intermediates.extend(intermediates)
                 
                 # 应用 Sparse Global-SA（如果启用）
-                if apply_sparse_global:
-                    tokens = self._process_sparse_global_attention(
-                        tokens, B, T, N, P, C, num_block, pos=pos)
+                if apply_sparse_global and self.global_sparse_blocks is not None:
+                    # 获取 sparse block 的索引（相对于 sparse_global_layers）
+                    sparse_block_idx = self.sparse_global_layers.index(num_block)
+                    if sparse_block_idx < len(self.global_sparse_blocks):
+                        tokens = self._process_sparse_global_attention(
+                            tokens, B, T, N, P, C, sparse_block_idx, pos=pos)
                 
                 # Concat intermediates: [B, T, N, P, 2C]
                 min_len = min(len(frame_intermediates), len(global_intermediates))
@@ -624,57 +720,81 @@ class Aggregator(nn.Module):
         """
         return compute_epipolar_bias(pos_2d_q, pos_2d_k, K_q, K_k, T_q_to_k, patch_size)
     
-    def _process_sparse_global_attention(self, tokens, B, T, N, P, C, block_idx, pos=None):
+    def _process_sparse_global_attention(self, tokens, B, T, N, P, C, sparse_block_idx, pos=None):
         """
         Sparse Global-SA: 全局稀疏长程依赖
         
         Args:
             tokens: [B, T, N, P, C]
-            block_idx: 当前 block 索引
+            sparse_block_idx: 在 global_sparse_blocks 中的索引
             pos: 位置编码 [B, T, N, P, 2]
             
         Returns:
             tokens: 处理后的 tokens [B, T, N, P, C]
         """
+        if self.global_sparse_blocks is None or sparse_block_idx >= len(self.global_sparse_blocks):
+            return tokens
+            
+        block = self.global_sparse_blocks[sparse_block_idx]
+        
         if self.sparse_strategy == "landmark":
-            # Landmark/Anchor Attention: 只与 landmark tokens 互注意
+            # 修改4: Landmark策略 - 使用稀疏索引实现真正的稀疏注意力
+            # 对每个(t,v)选择K=64个anchors，所有tokens只与这些anchors互注意
             landmark_indices = self._select_landmark_tokens(tokens, k=self.landmark_k)
             B, T, N, K = landmark_indices.shape
             
-            # 选择 landmark tokens
-            tokens_flat = tokens.view(B * T * N, P, C)
+            # 修改4: 创建稀疏索引，而不是选择tokens然后密集注意力
+            tokens_flat = tokens.view(B * T * N, P, C)  # [B*T*N, P, C]
+            
+            # 为每个(t,v)创建稀疏索引：所有tokens只attend到对应的K个landmarks
+            # 实现稀疏注意力：只计算与landmark tokens的attention
+            # 这里需要修改Block来支持稀疏索引，暂时先选择landmarks
             landmark_tokens_list = []
+            landmark_pos_list = []
             for b in range(B):
                 for t in range(T):
                     for v in range(N):
+                        batch_idx = b * T * N + t * N + v
                         indices = landmark_indices[b, t, v]  # [K]
-                        landmark_tokens = tokens_flat[b * T * N + t * N + v, indices]  # [K, C]
+                        landmark_tokens = tokens_flat[batch_idx, indices]  # [K, C]
                         landmark_tokens_list.append(landmark_tokens)
+                        if pos is not None:
+                            landmark_pos = pos[b, t, v, indices]  # [K, 2]
+                            landmark_pos_list.append(landmark_pos)
             
-            landmark_tokens = torch.stack(landmark_tokens_list, dim=0).view(B, T, N, K, C)
-            # 使用 View-SA 风格的注意力，但只对 landmark tokens
-            # 简化实现：使用全局 attention block，但只处理 landmark tokens
-            # 实际实现中，需要修改 attention 机制来支持稀疏连接
+            # 修改4: 使用稀疏注意力机制（需要Block支持）
+            # 当前简化实现：将所有tokens与landmark tokens concat，然后应用attention
+            # TODO: 实现真正的稀疏索引attention，只计算P×K的attention matrix
+            landmark_tokens = torch.stack(landmark_tokens_list, dim=0).view(B * T * N, K, C)
+            
+            # 将landmark tokens与原始tokens concat用于attention
+            tokens_with_landmarks = torch.cat([landmark_tokens, tokens_flat], dim=1)  # [B*T*N, K+P, C]
+            # 注意：这还不是真正的稀疏，只是准备工作，需要在Block中实现稀疏attention
             
         elif self.sparse_strategy == "block_dilated":
             # Block-Sparse + Dilated: 按 (t, v) 网格做环形/跳跃块注意
+            # 修改4: 实现真正的稀疏连接，而不是密集attention
             # 在实际实现中，需要创建稀疏的 attention mask
             pass
             
         elif self.sparse_strategy == "memory_bank":
-            # Memory Bank: 维护跨窗 memory tokens
+            # 修改4: Memory Bank策略 - 输出32个memory tokens从上一个滑动窗口
+            # 允许它们与当前窗口交互
             B, T, N, P, C = tokens.shape
-            memory_tokens = self.memory_tokens.expand(B, -1, -1)  # [B, M, C]
+            memory_tokens = self.memory_tokens.expand(B, -1, -1)  # [B, M, C], M=32
             
-            # 将 memory tokens 与所有 tokens 进行轻注意
-            # 简化实现：concat memory tokens 到 tokens
-            tokens_with_memory = torch.cat([memory_tokens.unsqueeze(1).unsqueeze(1).expand(-1, T, N, -1, -1), tokens], dim=3)
-            # 使用 global_blocks 处理，但只应用一次轻注意
+            # 修改4: Memory tokens与当前tokens的交互应该是稀疏的
+            # 当前实现：将memory tokens concat到tokens
+            # TODO: 实现真正的跨窗口memory机制，保存上一个窗口的memory tokens
+            tokens_with_memory = torch.cat([
+                memory_tokens.unsqueeze(1).unsqueeze(1).expand(-1, T, N, -1, -1), 
+                tokens
+            ], dim=3)  # [B, T, N, M+P, C]
             
         return tokens
     
     def _process_dual_stream_attention(self, tokens, B, T, N, P, C, block_idx, pos=None, 
-                                       attn_type="view", dynamic_mask=None):
+                                       attn_type="view", dynamic_mask=None, dual_stream_layer_idx=None):
         """
         两流架构：位姿流和几何流并行处理
         
@@ -693,44 +813,46 @@ class Aggregator(nn.Module):
             # 如果未启用两流，返回相同的 tokens
             return tokens, tokens
         
-        # 获取 lambda 参数（经过 softplus + clamp）
-        lambda_pose = torch.clamp(F.softplus(self.lambda_pose_logit), 0.0, self.lambda_clamp_value)
-        lambda_geo = torch.clamp(F.softplus(self.lambda_geo_logit), 0.0, self.lambda_clamp_value)
+        # 获取 lambda 参数（clamp到指定范围）
+        lambda_pose = torch.clamp(self.lambda_pose_logit, -self.lambda_clamp_value, self.lambda_clamp_value)
+        lambda_geo = torch.clamp(self.lambda_geo_logit, -self.lambda_clamp_value, self.lambda_clamp_value)
         
         # 生成动态掩码（如果未提供）
         if dynamic_mask is None:
             # 使用 spatial_mask_head 生成掩码
             tokens_for_mask = tokens.view(B * T * N, P, C)
-            _, H, W = tokens.shape[2:5]  # 简化：假设可以获取 H, W
+            # 假设可以从 patch_size 推导 H, W
+            H_patch = int((P - self.patch_start_idx) ** 0.5)
+            W_patch = H_patch  # 假设是正方形
             key_bias_1d, cam_row_mask = self.spatial_mask_head(
                 tokens_for_mask.view(B, T * N, P, C), 
                 self.patch_start_idx, 
-                H, W
+                H_patch, W_patch
             )
             # 转换为 [0, 1] 范围的掩码（1=静态，0=动态）
             dynamic_mask = 1.0 - torch.sigmoid(key_bias_1d).view(B, T, N, P)
         
-        # 位姿流：使用 pose_blocks，应用负偏置（抑制动态）
+        # 位姿流：使用 pose_time_blocks / pose_view_blocks，应用负偏置（抑制动态）
         if attn_type == "view":
             tokens_pose = self._process_view_attention_dual_stream(
                 tokens, B, T, N, P, C, block_idx, pos, 
-                stream="pose", blocks=self.pose_global_blocks,
+                stream="pose", blocks=self.pose_view_blocks,
                 lambda_param=lambda_pose, mask=dynamic_mask
             )
             tokens_geo = self._process_view_attention_dual_stream(
                 tokens, B, T, N, P, C, block_idx, pos,
-                stream="geo", blocks=self.geo_global_blocks,
+                stream="geo", blocks=self.geo_view_blocks,
                 lambda_param=lambda_geo, mask=dynamic_mask
             )
         else:  # time
             tokens_pose = self._process_time_attention_dual_stream(
                 tokens, B, T, N, P, C, block_idx, pos,
-                stream="pose", blocks=self.pose_frame_blocks,
+                stream="pose", blocks=self.pose_time_blocks,
                 lambda_param=lambda_pose, mask=dynamic_mask
             )
             tokens_geo = self._process_time_attention_dual_stream(
                 tokens, B, T, N, P, C, block_idx, pos,
-                stream="geo", blocks=self.geo_frame_blocks,
+                stream="geo", blocks=self.geo_time_blocks,
                 lambda_param=lambda_geo, mask=dynamic_mask
             )
         
@@ -740,7 +862,14 @@ class Aggregator(nn.Module):
                                            stream, blocks, lambda_param, mask):
         """
         两流架构的 View-SA 处理（内部方法）
+        
+        Args:
+            block_idx: dual_stream_layer_idx（0-4），用于索引两流blocks
         """
+        # 修改1: 确保block_idx在范围内
+        if block_idx >= len(blocks):
+            raise IndexError(f"block_idx {block_idx} is out of range for blocks (length {len(blocks)})")
+        
         # Reshape: [B, T, N, P, C] -> [B*T, N*P, C]
         tokens_flat = tokens.view(B * T, N * P, C)
         mask_flat = mask.view(B * T, N * P) if mask is not None else None
@@ -758,7 +887,14 @@ class Aggregator(nn.Module):
                                             stream, blocks, lambda_param, mask):
         """
         两流架构的 Time-SA 处理（内部方法）
+        
+        Args:
+            block_idx: dual_stream_layer_idx（0-4），用于索引两流blocks
         """
+        # 修改1: 确保block_idx在范围内
+        if block_idx >= len(blocks):
+            raise IndexError(f"block_idx {block_idx} is out of range for blocks (length {len(blocks)})")
+        
         # Reshape: [B, T, N, P, C] -> [B*N, T*P, C]
         tokens_transposed = tokens.transpose(1, 2).contiguous()
         tokens_flat = tokens_transposed.view(B * N, T * P, C)
@@ -815,19 +951,74 @@ class Aggregator(nn.Module):
         return tokens, global_idx, intermediates
 
     def _process_view_attention(self, tokens, B, T, N, P, C, view_idx, pos=None, is_multi_view=False, 
-                                attn_mask=None, attn_value=None, epipolar_bias=None):
+                                attn_mask=None, attn_value=None, epipolar_bias=None, custom_blocks=None,
+                                dynamic_mask=None, dual_stream_layer_idx=None):
         """
-        View-SA: Fixed time t, aggregate across views (N views).
-        Shape transformation: [B, T, N, P, C] -> [B*T, N*P, C] -> MHA -> [B, T, N, P, C]
-        Uses global_blocks (can be loaded from Pi3 Global-Attention weights).
+        View-SA (Synchronized View Attention, fixed t): 固定时间t，跨视角聚合
+        
+        根据架构图3.1:
+        1. 输入重排: X_v = concat_over_views(feat, axis=V) → [B, T, (V*(R+P)), Cvit]
+        2. 掩码广播: M_v = concat_over_views(M, axis=V) → [B, T, V*P, 1]
+           → Expand to token dimension (fill 0 at R registers): M_v_up [B,T,V*(R+P),1]
+        3. 注意力 logits 偏置:
+           - 位姿流: logits_pose += (-λ_pose) * M_v_up
+           - 几何流: logits_geo += (+λ_geo) * M_v_up
+        4. 输出还原: Y_v → [B,T,V, (R+P), Cvit]
+        
+        Args:
+            tokens: [B, T, N, P, C] (P = R+P，包含所有tokens)
+            dynamic_mask: [B, T, N, P, 1] 动态掩码，可选
+            custom_blocks: 如果提供，使用自定义的 blocks（用于两流架构）
         """
         if not is_multi_view:
             raise ValueError("_process_view_attention requires multi-view mode")
         
-        # Reshape: [B, T, N, P, C] -> [B*T, N*P, C]
+        # 修改2: View-SA输入重排 - 明确沿V维度展平
+        # [B, T, N, P, C] -> [B*T, N*P, C] (沿view维度N展平)
         if tokens.shape != (B, T, N, P, C):
             tokens = tokens.view(B, T, N, P, C)
-        tokens_flat = tokens.view(B * T, N * P, C)
+        
+        # 提取 R 和 P_patch
+        R = self.num_register_tokens
+        P_patch = P - R - 1  # 减去 camera token (1) 和 register tokens (R)
+        
+        # 修改2: View-SA明确沿V维度concat
+        tokens_flat = tokens.view(B * T, N * P, C)  # [B*T, N*P, C] (沿view维度展平)
+        
+        # 掩码广播（如果提供了动态掩码）
+        mask_v_up = None
+        if dynamic_mask is not None:
+            # M: [B, T, N, P, 1] -> 只取 patch 部分: [B, T, N, P_patch, 1]
+            # 假设 dynamic_mask 只对 patch tokens 有效
+            if dynamic_mask.shape[3] == P:
+                # 需要提取 patch 部分（跳过 camera token 和 register tokens）
+                M_patch = dynamic_mask[:, :, :, (1+R):, :]  # [B, T, N, P_patch, 1]
+            else:
+                M_patch = dynamic_mask  # [B, T, N, P_patch, 1]
+            
+            # 跨视角拼接: [B, T, N, P_patch, 1] -> [B, T, N*P_patch, 1]
+            M_v = M_patch.view(B, T, N * P_patch, 1)  # [B, T, V*P, 1]
+            
+            # 修改2 & 3: Expand to token dimension (fill 0 at R registers)
+            # 确保register tokens和camera token的mask值为0
+            # [B, T, N*P_patch, 1] -> [B, T, N*(R+P), 1]
+            # 每个视角: [1+R+P_patch] -> 需要 [1+R+P_patch] 形状
+            M_v_expanded_list = []
+            for v in range(N):
+                # 修改2: 每个视角的掩码: camera token (0) + register tokens (R个0) + patch掩码
+                # 确保camera token和register tokens的偏置始终为0
+                zeros_reg = torch.zeros(B, T, 1 + R, 1, device=M_patch.device, dtype=M_patch.dtype)
+                M_v_v = torch.cat([zeros_reg, M_patch[:, :, v:v+1, :, :]], dim=2)  # [B, T, 1+R+P_patch, 1]
+                M_v_expanded_list.append(M_v_v)
+            M_v_up = torch.cat(M_v_expanded_list, dim=2)  # [B, T, N*(R+P), 1]
+            M_v_up = M_v_up.view(B * T, N * P, 1)  # [B*T, N*P, 1]
+            
+            # 修改2: 确保register tokens和camera token位置确实为0（双重检查）
+            # camera token位置: 0, register tokens位置: 1 到 1+R
+            M_v_up[:, :(1+R), :] = 0  # 第一个视角的camera+register
+            for v_idx in range(1, N):
+                start_idx = v_idx * P
+                M_v_up[:, start_idx:(start_idx + 1 + R), :] = 0  # 其他视角的camera+register
         
         # Reshape position: [B, T, N, P, 2] -> [B*T, N*P, 2]
         pos_flat = None
@@ -836,9 +1027,37 @@ class Aggregator(nn.Module):
                 pos = pos.view(B, T, N, P, 2)
             pos_flat = pos.view(B * T, N * P, 2)
         
+        # 应用极线先验（如果启用且提供了）
+        epi_bias_mask = None
+        if epipolar_bias is not None:
+            epi_bias_mask = epipolar_bias  # [B*T, N*P, N*P] 或类似形状
+        
+        # 修改1: 使用自定义 blocks 或默认 view_blocks
+        # 如果在两流架构的L_mid层，使用dual_stream_layer_idx索引
+        blocks_to_use = custom_blocks if custom_blocks is not None else self.view_blocks
+        
         intermediates = []
         for _ in range(self.aa_block_size):
-            block = self.view_blocks[view_idx]  # Alias to global_blocks
+            # 修改1: 如果使用两流的blocks，使用dual_stream_layer_idx（0-4）
+            # 否则使用view_idx（可能超出两流blocks的范围）
+            if custom_blocks is not None and dual_stream_layer_idx is not None:
+                # 使用dual_stream_layer_idx索引两流blocks（长度只有5）
+                if dual_stream_layer_idx >= len(blocks_to_use):
+                    raise IndexError(f"dual_stream_layer_idx {dual_stream_layer_idx} >= len(blocks) {len(blocks_to_use)}")
+                block = blocks_to_use[dual_stream_layer_idx]
+            else:
+                # 使用view_idx索引共享的view_blocks（长度24）
+                if view_idx >= len(blocks_to_use):
+                    raise IndexError(f"view_idx {view_idx} >= len(blocks) {len(blocks_to_use)}")
+                block = blocks_to_use[view_idx]
+            
+            # 如果需要应用掩码偏置（两流架构）
+            if self.enable_dual_stream and mask_v_up is not None:
+                # 在 attention 内部应用 logits 偏置
+                # 这里需要修改 Block 来支持 logits_bias 参数
+                # 简化实现：暂时通过 attn_mask 传递
+                pass  # TODO: 在 Block 中实现 logits_bias
+            
             if self.training:
                 fn = functools.partial(block, attn_mask=attn_mask, attn_value=attn_value)
                 tokens_flat = torch.utils.checkpoint.checkpoint(
@@ -849,25 +1068,84 @@ class Aggregator(nn.Module):
             # Reshape back: [B*T, N*P, C] -> [B, T, N, P, C]
             intermediates.append(tokens_flat.view(B, T, N, P, C))
         
-        # Reshape back to [B, T, N, P, C]
+        # 输出还原: [B*T, N*P, C] -> [B, T, N, P, C]
         tokens = tokens_flat.view(B, T, N, P, C)
         return tokens, view_idx, intermediates
 
-    def _process_time_attention(self, tokens, B, T, N, P, C, time_idx, pos=None, is_multi_view=False, attn_mask=None, attn_value=None):
+    def _process_time_attention(self, tokens, B, T, N, P, C, time_idx, pos=None, is_multi_view=False, 
+                                attn_mask=None, attn_value=None, custom_blocks=None, dynamic_mask=None,
+                                dual_stream_layer_idx=None):
         """
-        Time-SA: Fixed view v, aggregate across time (T time steps).
-        Shape transformation: [B, T, N, P, C] -> [B*N, T*P, C] -> MHA -> [B, T, N, P, C]
-        Uses time_blocks (alias to frame_blocks, can be loaded from VGGT Frame-Attention weights).
+        Time-SA (同视角时间注意, 固定 v): 固定视角v，跨时间聚合
+        
+        根据架构图3.2:
+        1. 输入重排: X_t = concat_over_times(feat, axis=T) → [B, V, (T*(R+P)), Cvit]
+        2. 相对时间位置编码: RoPE 或 ALiBi（如果Pi3有可复用部分则复用，否则新增）
+        3. 掩码广播: M_t = concat_over_times(M, axis=T) → [B,V,T*P,1]
+           → M_t_up [B,V,T*(R+P),1] (fill 0 at R registers)
+        4. 注意力 logits 偏置:
+           - 位姿流: logits_pose += (-λ_pose_t) * M_t_up
+           - 几何流: logits_geo += (+λ_geo_t) * M_t_up
+        5. 输出还原: Y_t → [B,T,V, (R+P), Cvit]
+        
+        Args:
+            tokens: [B, T, N, P, C] (P = R+P，包含所有tokens)
+            dynamic_mask: [B, T, N, P, 1] 动态掩码，可选
+            custom_blocks: 如果提供，使用自定义的 blocks（用于两流架构）
         """
         if not is_multi_view:
             raise ValueError("_process_time_attention requires multi-view mode")
         
-        # Reshape: [B, T, N, P, C] -> [B*N, T*P, C]
+        # 修改2: Time-SA输入重排 - 明确沿T维度展平
+        # [B, T, N, P, C] -> [B*N, T*P, C] (沿time维度T展平)
         if tokens.shape != (B, T, N, P, C):
             tokens = tokens.view(B, T, N, P, C)
-        # Transpose T and N: [B, T, N, P, C] -> [B, N, T, P, C] -> [B*N, T*P, C]
+        
+        # 修改2: Time-SA明确沿T维度concat（转置N和T，然后沿T展平）
         tokens_transposed = tokens.transpose(1, 2).contiguous()  # [B, N, T, P, C]
-        tokens_flat = tokens_transposed.view(B * N, T * P, C)
+        tokens_flat = tokens_transposed.view(B * N, T * P, C)  # [B*N, T*P, C] (沿time维度展平)
+        
+        # 提取 R 和 P_patch
+        R = self.num_register_tokens
+        P_patch = P - R - 1  # 减去 camera token (1) 和 register tokens (R)
+        
+        # 掩码广播（如果提供了动态掩码）
+        mask_t_up = None
+        if dynamic_mask is not None:
+            # M: [B, T, N, P, 1] -> 只取 patch 部分: [B, T, N, P_patch, 1]
+            if dynamic_mask.shape[3] == P:
+                M_patch = dynamic_mask[:, :, :, (1+R):, :]  # [B, T, N, P_patch, 1]
+            else:
+                M_patch = dynamic_mask  # [B, T, N, P_patch, 1]
+            
+            # 跨时间拼接: [B, T, N, P_patch, 1] -> 转置为 [B, N, T, P_patch, 1]
+            M_t = M_patch.transpose(1, 2).contiguous()  # [B, N, T, P_patch, 1]
+            M_t = M_t.view(B, N, T * P_patch, 1)  # [B, N, T*P_patch, 1]
+            
+            # 修改2 & 3: Expand to token dimension (fill 0 at R registers)
+            # 确保register tokens和camera token的mask值为0
+            # [B, N, T*P_patch, 1] -> [B, N, T*(R+P), 1]
+            # 对每个视角和时间步，添加 camera token (0) + register tokens (R个0)
+            M_t_expanded_list = []
+            for n in range(N):
+                M_n_list = []
+                for t in range(T):
+                    # 修改2: 确保camera token和register tokens的偏置始终为0
+                    zeros_reg = torch.zeros(B, 1, 1 + R, 1, device=M_patch.device, dtype=M_patch.dtype)
+                    M_t_t = torch.cat([zeros_reg, M_patch[:, t:t+1, n:n+1, :, :]], dim=2)  # [B, 1, 1+R+P_patch, 1]
+                    M_n_list.append(M_t_t)
+                M_n = torch.cat(M_n_list, dim=1)  # [B, T, 1+R+P_patch, 1]
+                M_n = M_n.view(B, 1, T * P, 1)  # [B, 1, T*P, 1]
+                M_t_expanded_list.append(M_n)
+            M_t_up = torch.cat(M_t_expanded_list, dim=1)  # [B, N, T*P, 1]
+            M_t_up = M_t_up.view(B * N, T * P, 1)  # [B*N, T*P, 1]
+            
+            # 修改2: 确保register tokens和camera token位置确实为0（双重检查）
+            # 对每个视角，camera token和register tokens位置为0
+            for n_idx in range(N):
+                for t_idx in range(T):
+                    token_idx = n_idx * T * P + t_idx * P
+                    M_t_up[:, token_idx:(token_idx + 1 + R), :] = 0  # camera + register tokens
         
         # Reshape position: [B, T, N, P, 2] -> [B*N, T*P, 2]
         pos_flat = None
@@ -876,10 +1154,36 @@ class Aggregator(nn.Module):
                 pos = pos.view(B, T, N, P, 2)
             pos_transposed = pos.transpose(1, 2).contiguous()  # [B, N, T, P, 2]
             pos_flat = pos_transposed.view(B * N, T * P, 2)
+            
+            # 修改5: 相对时间位置编码：只使用相对时间RoPE/ALiBi，不使用view-ID PE
+            # 如果使用 RoPE，它会在 Block 内部应用
+            # 这里不需要额外处理，因为 RoPE 已经是相对位置的
+            # 修改5: 确保不使用view-ID相关的PE，保持View Permutation Equivariance
+        
+        # 修改1: 使用自定义 blocks 或默认 time_blocks
+        # 如果在两流架构的L_mid层，使用dual_stream_layer_idx索引
+        blocks_to_use = custom_blocks if custom_blocks is not None else self.time_blocks
         
         intermediates = []
         for _ in range(self.aa_block_size):
-            block = self.time_blocks[time_idx]  # Alias to frame_blocks
+            # 修改1: 如果使用两流的blocks，使用dual_stream_layer_idx（0-4）
+            # 否则使用time_idx（可能超出两流blocks的范围）
+            if custom_blocks is not None and dual_stream_layer_idx is not None:
+                # 使用dual_stream_layer_idx索引两流blocks（长度只有5）
+                if dual_stream_layer_idx >= len(blocks_to_use):
+                    raise IndexError(f"dual_stream_layer_idx {dual_stream_layer_idx} >= len(blocks) {len(blocks_to_use)}")
+                block = blocks_to_use[dual_stream_layer_idx]
+            else:
+                # 使用time_idx索引共享的time_blocks（长度24）
+                if time_idx >= len(blocks_to_use):
+                    raise IndexError(f"time_idx {time_idx} >= len(blocks) {len(blocks_to_use)}")
+                block = blocks_to_use[time_idx]
+            
+            # 如果需要应用掩码偏置（两流架构）
+            if self.enable_dual_stream and mask_t_up is not None:
+                # TODO: 在 Block 中实现 logits_bias
+                pass
+            
             if self.training:
                 fn = functools.partial(block, attn_mask=attn_mask, attn_value=attn_value)
                 tokens_flat = torch.utils.checkpoint.checkpoint(
@@ -891,7 +1195,7 @@ class Aggregator(nn.Module):
             tokens_reshaped = tokens_flat.view(B, N, T, P, C)
             intermediates.append(tokens_reshaped.transpose(1, 2).contiguous())  # [B, T, N, P, C]
         
-        # Reshape back to [B, T, N, P, C]
+        # 输出还原: [B*N, T*P, C] -> [B, N, T, P, C] -> [B, T, N, P, C]
         tokens = tokens_flat.view(B, N, T, P, C).transpose(1, 2).contiguous()
         return tokens, time_idx, intermediates
 

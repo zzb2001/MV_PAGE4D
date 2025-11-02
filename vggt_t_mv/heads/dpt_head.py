@@ -9,7 +9,7 @@
 
 
 import os
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
@@ -64,6 +64,9 @@ class DPTHead(nn.Module):
         self.intermediate_layer_idx = intermediate_layer_idx
 
         self.norm = nn.LayerNorm(dim_in)
+        
+        # 维度适配投影（如果输入的tokens维度与dim_in不匹配）
+        self.dim_adapter = None  # 在forward中动态创建
 
         # Projection layers for each output channel from tokens.
         self.projects = nn.ModuleList(
@@ -118,56 +121,109 @@ class DPTHead(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 8,
+        dual_stream_outputs: Optional[Dict] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
-            images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+            images (Tensor): Input images with shape [B, S, 3, H, W] or [B, T, N, 3, H, W], in range [0, 1].
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
             frames_chunk_size (int, optional): Number of frames to process in each chunk.
                 If None or larger than S, all frames are processed at once. Default: 8.
+            dual_stream_outputs (dict, optional): 两流架构输出，包含'geo'流特征
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]:
-                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
-                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+                - If feature_only=True: Feature maps with shape [B, S, C, H, W] or [B, T, N, C, H, W]
+                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W] or [B, T, N, 1, H, W]
         """
-        B, S, _, H, W = images.shape
+        # 检测输入格式：支持 [B, S, 3, H, W] 或 [B, T, N, 3, H, W]
+        is_multi_view = len(images.shape) == 6
+        original_shape = images.shape
+        
+        if is_multi_view:
+            # 多视角时序格式: [B, T, N, 3, H, W] -> [B, T*N, 3, H, W]
+            B, T, N, C, H, W = images.shape
+            images = images.view(B, T * N, C, H, W)
+            S = T * N
+        else:
+            # 单视角时序格式: [B, S, 3, H, W]
+            B, S, _, H, W = images.shape
 
+        # 根据架构图4.2: 如果使用两流架构，优先使用几何流的输出
+        if dual_stream_outputs is not None and 'geo' in dual_stream_outputs:
+            geo_tokens_list = dual_stream_outputs['geo']
+            if len(geo_tokens_list) > 0:
+                # 使用几何流的中间层特征
+                aggregated_tokens_list = geo_tokens_list
+        
+        # 如果是多视角格式，需要将tokens也转换为单序列格式
+        if is_multi_view:
+            # aggregated_tokens_list中的每个tensor是 [B, T, N, P, C]
+            # 需要转换为 [B, T*N, P, C]
+            aggregated_tokens_list_flat = []
+            for tokens in aggregated_tokens_list:
+                if len(tokens.shape) == 5:
+                    # [B, T, N, P, C] -> [B, T*N, P, C]
+                    B_t, T_t, N_t, P_t, C_t = tokens.shape
+                    tokens_flat = tokens.view(B_t, T_t * N_t, P_t, C_t)
+                    aggregated_tokens_list_flat.append(tokens_flat)
+                else:
+                    aggregated_tokens_list_flat.append(tokens)
+            aggregated_tokens_list = aggregated_tokens_list_flat
+        
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
-
-        # Otherwise, process frames in chunks to manage memory usage
-        assert frames_chunk_size > 0
-
-        # Process frames in batches
-        all_preds = []
-        all_conf = []
-
-        for frames_start_idx in range(0, S, frames_chunk_size):
-            frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
-
-            # Process batch of frames
-            if self.feature_only:
-                chunk_output = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
-                all_preds.append(chunk_output)
-            else:
-                chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
-                all_preds.append(chunk_preds)
-                all_conf.append(chunk_conf)
-
-        # Concatenate results along the sequence dimension
-        if self.feature_only:
-            return torch.cat(all_preds, dim=1)
+            output = self._forward_impl(aggregated_tokens_list, images, patch_start_idx, is_multi_view=is_multi_view, T=T if is_multi_view else None, N=N if is_multi_view else None)
         else:
-            return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
+            # Otherwise, process frames in chunks to manage memory usage
+            assert frames_chunk_size > 0
+
+            # Process frames in batches
+            all_preds = []
+            all_conf = []
+
+            for frames_start_idx in range(0, S, frames_chunk_size):
+                frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
+
+                # Process batch of frames
+                if self.feature_only:
+                    chunk_output = self._forward_impl(
+                        aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                        is_multi_view=False  # chunk内部使用单序列格式
+                    )
+                    all_preds.append(chunk_output)
+                else:
+                    chunk_preds, chunk_conf = self._forward_impl(
+                        aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                        is_multi_view=False  # chunk内部使用单序列格式
+                    )
+                    all_preds.append(chunk_preds)
+                    all_conf.append(chunk_conf)
+
+            # Concatenate results along the sequence dimension
+            if self.feature_only:
+                output = torch.cat(all_preds, dim=1)
+            else:
+                output = (torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1))
+        
+        # 如果是多视角格式，需要将输出还原为 [B, T, N, ...] 格式
+        if is_multi_view:
+            if self.feature_only:
+                # output: [B, T*N, C, H, W] -> [B, T, N, C, H, W]
+                B_out, S_out = output.shape[0], output.shape[1]
+                output = output.view(B_out, T, N, *output.shape[2:])
+            else:
+                # output: ([B, T*N, 1, H, W], [B, T*N, 1, H, W]) -> ([B, T, N, 1, H, W], [B, T, N, 1, H, W])
+                preds, conf = output
+                B_out, S_out = preds.shape[0], preds.shape[1]
+                preds = preds.view(B_out, T, N, *preds.shape[2:])
+                conf = conf.view(B_out, T, N, *conf.shape[2:])
+                output = (preds, conf)
+        
+        return output
 
     def _forward_impl(
         self,
@@ -176,6 +232,9 @@ class DPTHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        is_multi_view: bool = False,
+        T: int = None,
+        N: int = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Implementation of the forward pass through the DPT head.
@@ -184,10 +243,14 @@ class DPTHead(nn.Module):
 
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
+                Expected shape: [B, S, P, C] (single sequence format)
             images (Tensor): Input images with shape [B, S, 3, H, W].
             patch_start_idx (int): Starting index for patch tokens.
             frames_start_idx (int, optional): Starting index for frames to process.
             frames_end_idx (int, optional): Ending index for frames to process.
+            is_multi_view (bool): Whether the input is in multi-view format (for output reshaping).
+            T (int, optional): Number of time frames (for multi-view output reshaping).
+            N (int, optional): Number of views (for multi-view output reshaping).
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
@@ -210,6 +273,17 @@ class DPTHead(nn.Module):
                 x = x[:, frames_start_idx:frames_end_idx]
 
             x = x.reshape(B * S, -1, x.shape[-1])
+
+            # 维度适配：如果输入维度不等于dim_in，添加投影层
+            if x.shape[-1] != self.norm.normalized_shape[0]:
+                if self.dim_adapter is None:
+                    # 动态创建维度适配器并注册为子模块
+                    input_dim = x.shape[-1]
+                    self.dim_adapter = nn.Linear(input_dim, self.norm.normalized_shape[0])
+                    self.dim_adapter = self.dim_adapter.to(x.device)
+                    # 注册为子模块，使其成为模型的一部分
+                    self.add_module('dim_adapter', self.dim_adapter)
+                x = self.dim_adapter(x)
 
             x = self.norm(x)
 
