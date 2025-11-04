@@ -113,11 +113,87 @@ class CameraHead(nn.Module):
             # But we want [B, V] camera tokens (one per view, shared across time)
             # Strategy: extract Zc[v] by taking camera token from first time step for each view
             B = tokens.shape[0]
-            # Ensure tokens are in correct format: [B, T*V, P, C]
-            # Reshape: [B, T*V, P, C] -> [B, T, V, P, C]
-            tokens_mv = tokens.reshape(B, T, V, tokens.shape[2], tokens.shape[3])
-            # Extract camera tokens from first time step: [B, V, C]
-            pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+            # 检查tokens的实际形状并正确reshape
+            # tokens可能是 [B, S, P, C] 或 [B, T*V, P, C] 或 [B, N, C] 格式
+            C = tokens.shape[-1]
+            pose_tokens_mv = None  # 初始化
+            
+            # 尝试reshape tokens为 [B, T, V, P, C] 格式
+            if len(tokens.shape) == 4:
+                # tokens是 [B, S, P, C] 或 [B, T*V, P, C] 格式
+                S_or_TV, P = tokens.shape[1], tokens.shape[2]
+                expected_size = B * T * V * P * C
+                actual_size = tokens.numel()
+                
+                if actual_size == expected_size:
+                    # 大小匹配，直接reshape
+                    try:
+                        tokens_mv = tokens.reshape(B, T, V, P, C)
+                        pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+                    except RuntimeError:
+                        # reshape失败，从原始tokens提取
+                        pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+                elif S_or_TV == T * V:
+                    # S_or_TV == T*V，可以reshape
+                    try:
+                        tokens_mv = tokens.reshape(B, T, V, P, C)
+                        pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+                    except RuntimeError:
+                        # reshape失败，从原始tokens提取
+                        pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+                else:
+                    # 大小不匹配，尝试推断P
+                    P_inferred = actual_size // (B * T * V * C) if actual_size % (B * T * V * C) == 0 else None
+                    if P_inferred is not None and tokens.numel() == B * T * V * P_inferred * C:
+                        try:
+                            tokens_mv = tokens.reshape(B, T, V, P_inferred, C)
+                            pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+                        except RuntimeError:
+                            pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+                    else:
+                        # 无法reshape，从原始tokens提取camera tokens
+                        pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+            elif len(tokens.shape) == 3:
+                # tokens是 [B, N, C] 格式，需要推断如何reshape
+                N = tokens.shape[1]
+                # 尝试推断：如果N == T*V，则tokens是 [B, T*V, C]
+                # 如果N == T*V*P，则tokens是扁平化的 [B, T*V*P, C]
+                if N == T * V:
+                    # tokens是 [B, T*V, C]，需要添加P维度
+                    try:
+                        tokens_mv = tokens.reshape(B, T, V, 1, C)
+                        pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+                    except RuntimeError:
+                        pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
+                elif N % (T * V) == 0:
+                    # N可以被T*V整除，推断P
+                    P_inferred = N // (T * V)
+                    if tokens.numel() == B * T * V * P_inferred * C:
+                        try:
+                            tokens_mv = tokens.reshape(B, T, V, P_inferred, C)
+                            pose_tokens_mv = tokens_mv[:, 0, :, 0, :]  # [B, V, C]
+                        except RuntimeError:
+                            pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
+                    else:
+                        # 无法reshape，从原始tokens提取
+                        pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
+                else:
+                    # 无法推断，从原始tokens提取
+                    pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
+            else:
+                # 其他格式，从原始tokens提取
+                if len(tokens.shape) == 4:
+                    pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+                else:
+                    pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
+            
+            # 确保pose_tokens_mv已设置
+            if pose_tokens_mv is None:
+                # 如果还未设置，使用默认提取方式
+                if len(tokens.shape) == 4:
+                    pose_tokens_mv = tokens[:, 0:V, 0, :]  # [B, V, C]
+                else:
+                    pose_tokens_mv = tokens[:, 0:V, :]  # [B, V, C]
             
             # DEBUG: Check camera token differences before processing
             if torch.rand(1).item() < 0.01:  # Print 1% of the time to avoid spam

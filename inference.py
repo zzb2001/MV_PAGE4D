@@ -4,17 +4,19 @@ import cv2
 import matplotlib.pyplot as plt
 import open3d as o3d
 import torch
-from vggt_t_mv.utils.pose_enc import pose_encoding_to_extri_intri
+from mv_page4d_lite.utils.pose_enc import pose_encoding_to_extri_intri
 import numpy as np
 from vggt.utils.load_fn import load_and_preprocess_images
 import json
 from utils.metrics import *
 from utils.visual import *
-from vggt_t_mv.models.vggt import VGGT as VGGT_MV
+from mv_page4d_lite.models.vggt import VGGT as VGGT_MV
+from train_mv_page4d_lite import save_comprehensive_results_epoch
 from PIL import Image
 from torchvision import transforms as TF
 import re
 import glob
+import time
 
 # sudo chown -R kz1024 /PHShome/kz1024
 
@@ -287,208 +289,6 @@ def process(model, image_names, device, directory='image', name='vggt'):
         json.dump(int_Dict_clean, f, indent=4)
 
 
-def save_predictions_visualization(predictions, output_dir="./output_visualization", prefix="output"):
-    """
-    保存预测结果的可视化：
-    1. depth 保存为 4*6 的大图（24个视图）
-    2. world_points 保存为 4*6 的大图（24个视图）
-    3. 保存全局点云（所有视图的点云合并）
-    
-    Args:
-        predictions: 模型输出字典，包含 'depth', 'world_points' 等
-        output_dir: 输出目录
-        prefix: 文件名前缀
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 获取数据形状
-    if "depth" in predictions:
-        depth = predictions["depth"]  # [B, T, N, H, W] 或 [B, S, H, W]
-        depth_shape = depth.shape
-        print(f"Depth shape: {depth_shape}")
-        
-        # 判断输入格式
-        if len(depth_shape) == 5:
-            # 多视角格式 [B, T, N, H, W]
-            B, T, N, H, W = depth_shape
-            total_views = T * N
-            depth_flat = depth[0].view(total_views, H, W)  # [T*N, H, W]
-        elif len(depth_shape) == 4:
-            # 单视角格式 [B, S, H, W]
-            B, S, H, W = depth_shape
-            total_views = S
-            depth_flat = depth[0]  # [S, H, W]
-        else:
-            print(f"Unknown depth shape: {depth_shape}, skipping depth visualization")
-            depth_flat = None
-        
-        if depth_flat is not None:
-            # 创建 4*6 大图
-            rows, cols = 4, 6
-            if total_views <= rows * cols:
-                # 转换为 numpy 并归一化
-                depth_np = depth_flat.cpu().numpy()
-                
-                # 归一化到 [0, 1]（每张图独立归一化）
-                depth_normalized = []
-                for i in range(min(total_views, rows * cols)):
-                    d = depth_np[i]
-                    if d.max() > d.min():
-                        d_norm = (d - d.min()) / (d.max() - d.min())
-                    else:
-                        d_norm = d
-                    depth_normalized.append(d_norm)
-                
-                # 应用 colormap (viridis)
-                cmap = plt.cm.viridis
-                depth_colored = [cmap(d)[:, :, :3] for d in depth_normalized]  # 去掉 alpha
-                
-                # 创建大图
-                fig, axes = plt.subplots(rows, cols, figsize=(cols*2, rows*2))
-                axes = axes.flatten() if rows > 1 else [axes]
-                
-                for idx in range(rows * cols):
-                    ax = axes[idx]
-                    if idx < len(depth_colored):
-                        ax.imshow(depth_colored[idx])
-                        ax.set_title(f"View {idx}", fontsize=8)
-                    ax.axis('off')
-                
-                plt.tight_layout()
-                depth_path = os.path.join(output_dir, f"{prefix}_depth_grid.png")
-                plt.savefig(depth_path, dpi=150, bbox_inches='tight')
-                plt.close()
-                print(f"Saved depth grid to {depth_path}")
-    
-    if "world_points" in predictions:
-        world_points = predictions["world_points"]  # [B, T, N, H, W, 3] 或 [B, S, H, W, 3]
-        wp_shape = world_points.shape
-        print(f"World points shape: {wp_shape}")
-        
-        # 判断输入格式
-        if len(wp_shape) == 6:
-            # 多视角格式 [B, T, N, H, W, 3]
-            B, T, N, H, W, _ = wp_shape
-            total_views = T * N
-            wp_flat = world_points[0].view(total_views, H, W, 3)  # [T*N, H, W, 3]
-        elif len(wp_shape) == 5:
-            # 单视角格式 [B, S, H, W, 3]
-            B, S, H, W, _ = wp_shape
-            total_views = S
-            wp_flat = world_points[0]  # [S, H, W, 3]
-        else:
-            print(f"Unknown world_points shape: {wp_shape}, skipping visualization")
-            wp_flat = None
-        
-        if wp_flat is not None:
-            # 创建 4*6 大图（可视化每个视图的点云投影）
-            rows, cols = 4, 6
-            
-            # 计算每个视图的点云范围（用于可视化）
-            wp_np = wp_flat.cpu().numpy()
-            
-            # 为每个视图创建一个 2D 投影可视化
-            fig, axes = plt.subplots(rows, cols, figsize=(cols*2, rows*2))
-            axes = axes.flatten() if rows > 1 else [axes]
-            
-            for idx in range(min(total_views, rows * cols)):
-                ax = axes[idx]
-                if idx < total_views:
-                    wp_view = wp_np[idx]  # [H, W, 3]
-                    # 计算有效的点（非零或非 NaN）
-                    valid_mask = np.isfinite(wp_view).all(axis=-1) & (np.linalg.norm(wp_view, axis=-1) > 1e-6)
-                    
-                    if valid_mask.sum() > 0:
-                        # 使用 Z 坐标作为深度可视化
-                        z_coords = wp_view[:, :, 2]
-                        z_masked = np.where(valid_mask, z_coords, np.nan)
-                        
-                        im = ax.imshow(z_masked, cmap='viridis')
-                        ax.set_title(f"View {idx} (Z)", fontsize=8)
-                    else:
-                        ax.text(0.5, 0.5, "No valid points", ha='center', va='center')
-                    ax.axis('off')
-            
-            plt.tight_layout()
-            wp_path = os.path.join(output_dir, f"{prefix}_world_points_grid.png")
-            plt.savefig(wp_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"Saved world points grid to {wp_path}")
-            
-            # 保存全局点云（合并所有视图）
-            print("Collecting global point cloud...")
-            all_points = []
-            all_colors = []
-            
-            # 获取原始图像用于着色（如果有）
-            images = predictions.get("images", None)
-            
-            if len(wp_shape) == 6:
-                # 多视角格式
-                for t in range(T):
-                    for v in range(N):
-                        wp_view = wp_np[t * N + v]  # [H, W, 3]
-                        valid_mask = np.isfinite(wp_view).all(axis=-1) & (np.linalg.norm(wp_view, axis=-1) > 1e-6)
-                        
-                        if valid_mask.sum() > 0:
-                            points_flat = wp_view.reshape(-1, 3)
-                            valid_points = points_flat[valid_mask.flatten()]
-                            all_points.append(valid_points)
-                            
-                            # 如果有图像，提取对应的颜色
-                            if images is not None:
-                                img_view = images[0, t, v].cpu().numpy()  # [C, H, W]
-                                if img_view.max() <= 1.0:
-                                    img_view = (img_view * 255).astype(np.uint8)
-                                else:
-                                    img_view = img_view.astype(np.uint8)
-                                img_view = img_view.transpose(1, 2, 0)  # [H, W, C]
-                                colors_flat = img_view.reshape(-1, 3)
-                                valid_colors = colors_flat[valid_mask.flatten()] / 255.0
-                                all_colors.append(valid_colors)
-            elif len(wp_shape) == 5:
-                # 单视角格式
-                for s in range(total_views):
-                    wp_view = wp_np[s]  # [H, W, 3]
-                    valid_mask = np.isfinite(wp_view).all(axis=-1) & (np.linalg.norm(wp_view, axis=-1) > 1e-6)
-                    
-                    if valid_mask.sum() > 0:
-                        points_flat = wp_view.reshape(-1, 3)
-                        valid_points = points_flat[valid_mask.flatten()]
-                        all_points.append(valid_points)
-                        
-                        if images is not None:
-                            img_view = images[0, s].cpu().numpy()
-                            if img_view.max() <= 1.0:
-                                img_view = (img_view * 255).astype(np.uint8)
-                            else:
-                                img_view = img_view.astype(np.uint8)
-                            img_view = img_view.transpose(1, 2, 0)
-                            colors_flat = img_view.reshape(-1, 3)
-                            valid_colors = colors_flat[valid_mask.flatten()] / 255.0
-                            all_colors.append(valid_colors)
-            
-            if all_points:
-                # 合并所有点
-                global_points = np.concatenate(all_points, axis=0)
-                print(f"Global point cloud: {len(global_points)} points")
-                
-                # 创建 Open3D 点云
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(global_points)
-                
-                # 添加颜色（如果有）
-                if all_colors:
-                    global_colors = np.concatenate(all_colors, axis=0)
-                    pcd.colors = o3d.utility.Vector3dVector(global_colors)
-                
-                # 保存点云
-                pcd_path = os.path.join(output_dir, f"{prefix}_global_pointcloud.ply")
-                o3d.io.write_point_cloud(pcd_path, pcd)
-                print(f"Saved global point cloud to {pcd_path}")
-            else:
-                print("Warning: No valid points found for global point cloud")
-
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -496,10 +296,10 @@ if __name__ == "__main__":
         0] >= 8 else torch.float16
     
     # 加载时序多视角数据
-    data_dir = "data/t"
+    data_dir = "data/images"
     if os.path.exists(data_dir):
         print(f"Loading time-view images from {data_dir}")
-        images_tv, metadata = load_time_view_images(data_dir, target_size=518, mode="crop")
+        images_tv, metadata = load_time_view_images(data_dir, target_size=378, mode="crop")
         # images_tv shape: [T, V, C, H, W]
         print(f"Loaded images with shape: {images_tv.shape}")
         print(f"Time frames: {metadata['T']}, Views: {metadata['V']}")
@@ -531,61 +331,84 @@ if __name__ == "__main__":
         # 初始化 vggt_t_mv 模型，使用多视角模式
         origin = "checkpoint/checkpoint_150.pt"
         model_mv = VGGT_MV(
-            img_size=518,
+            enable_gaussian=True,  # Enable GS Head
+            gaussian_output_dim=83,  # Default: 1(opacity) + 3(scales) + 4(rotations) + 3*25(SH_4) = 83
+            img_size=378,  # 匹配target_size=378
             patch_size=14,
             embed_dim=1024,
             enable_camera=True,
             enable_point=True,
             enable_depth=True,
-            enable_track=True
+            enable_track=False,  # 阶段1不训练track
+            enable_voxelization=True,  # 启用体素化
+            enable_fusion=True,  # 启用融合
+            enable_rendering=True,  # 启用渲染
         )
         
-        # 加载权重（使用新的权重加载方法）
-        pi3_path ='/home/star/zzb/Pi3/ckpts/model.safetensors'   # 可选：Pi3模型路径，如 "facebook/Pi3" 或本地路径
-        # pi3_path = "/path/to/pi3/model"  # 取消注释以加载Pi3权重
-        
-        stats = model_mv.load_pretrained_weights(
-            checkpoint_path=origin if os.path.exists(origin) else None,
-            pi3_path=pi3_path,
-            device=device
-        )
-        
-        print(f"Weight loading stats: {stats}")
+        # 加载权重
+        if os.path.exists(origin):
+            print(f"Loading checkpoint from {origin}")
+            checkpoint = torch.load(origin, map_location=device)
+            
+            # 尝试加载权重
+            if isinstance(checkpoint, dict):
+                if 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                elif 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
+                
+                # 移除不匹配的键（例如新的模块）
+                model_state_dict = model_mv.state_dict()
+                filtered_state_dict = {}
+                for k, v in state_dict.items():
+                    if k in model_state_dict:
+                        if model_state_dict[k].shape == v.shape:
+                            filtered_state_dict[k] = v
+                        else:
+                            print(f"  Skipping {k}: shape mismatch ({model_state_dict[k].shape} vs {v.shape})")
+                    else:
+                        print(f"  Skipping {k}: not in model")
+                
+                model_mv.load_state_dict(filtered_state_dict, strict=False)
+                print(f"Loaded {len(filtered_state_dict)}/{len(state_dict)} weights from checkpoint")
+            else:
+                model_mv.load_state_dict(checkpoint, strict=False)
+                print(f"Loaded checkpoint weights")
+        else:
+            print(f"Checkpoint not found at {origin}, using random initialization")
         
         model_mv.to(device)
         model_mv.eval()
         
+
+        
         # 推理
-        print(f"Running inference...")
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=dtype):
+                记录前向传播开始时间
+                start_time = time.time() 
+                print("Calling model_mv(images_batch)...")
                 predictions = model_mv(images_batch)
-        # for key, value in predictions.items():
-        #     if type(value) == torch.Tensor:
-        #         print(f"{key}: {value.shape}")
-        #     else:
-        #         print(f"{key}: {len(value)}")
-        print(f"Inference completed. Predictions keys: {list(predictions.keys())}")
-        
-        # 保存结果
-        save_predictions_visualization(
-            predictions=predictions,
-            output_dir="./output_visualization",
-            prefix="multi_view"
-        )
-        print()
-        
-        # for category in folders:
-        #     if data_name.startswith("online_img"):
-        #         image_names = [f for f in os.listdir(os.path.join(
-        #             directory, category)) if f.endswith('.png') or f.endswith('.jpg')]
-        #         try:
-        #             image_names.sort(key=lambda x: int(os.path.splitext(x)[0]))
-        #         except:
-        #             image_names.sort(key=lambda x: int(
-        #                 x.split('_')[-1].split('.')[0]))
-        #         image_names = [os.path.join(directory, category, f)
-        #                        for f in image_names][:24]
-        #     process(model, image_names, device,
-        #             directory=f'{data_name}/fig1_update_dpg', name=f'dpg_{category}')
+                end_time = time.time()
+                print(f"Model forward pass completed in {end_time - start_time:.2f} seconds")
+                
+                save_dir = "results/inference"
+                os.makedirs(save_dir, exist_ok=True)
+                
+                print(f"  🎯 Saving comprehensive results...")
+                save_comprehensive_results_epoch(
+                    model_mv,
+                    images_batch,
+                    device,
+                    save_dir,
+                    epoch=0,  # inference时使用epoch=0
+                    sample_idx=0,
+                    downsample_ratio=2
+                )
+                print("Comprehensive results saved successfully")
+                
+
+                    
 

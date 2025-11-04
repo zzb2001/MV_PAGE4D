@@ -19,7 +19,9 @@ from torchvision import transforms as TF
 import re
 import glob
 import random
+import struct
 from datetime import datetime
+from typing import Optional, Tuple, Dict, List
 
 # sudo chown -R kz1024 /PHShome/kz1024
 
@@ -75,6 +77,650 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def save_gaussian_ply(xyz, opacity, scales, rotations, sh_coeffs, filepath, sh_degree=3):
+    """
+    保存3D Gaussian Splatting参数为标准PLY格式
+    
+    Args:
+        xyz: [N, 3] 高斯位置
+        opacity: [N] 不透明度
+        scales: [N, 3] 尺度
+        rotations: [N, 4] 旋转四元数
+        sh_coeffs: [N, 3, (sh_degree+1)**2] 球谐系数
+        filepath: 保存路径
+        sh_degree: 球谐次数（默认3，对应45个系数）
+    """
+    N = xyz.shape[0]
+    xyz = xyz.cpu().numpy() if torch.is_tensor(xyz) else xyz
+    opacity = opacity.cpu().numpy() if torch.is_tensor(opacity) else opacity
+    scales = scales.cpu().numpy() if torch.is_tensor(scales) else scales
+    rotations = rotations.cpu().numpy() if torch.is_tensor(rotations) else rotations
+    sh_coeffs = sh_coeffs.cpu().numpy() if torch.is_tensor(sh_coeffs) else sh_coeffs
+    
+    # 确保sh_coeffs形状正确 [N, 3, (sh_degree+1)**2]
+    if len(sh_coeffs.shape) == 2:
+        # 如果是 [N, 3*(sh_degree+1)**2]，需要reshape
+        sh_coeffs = sh_coeffs.reshape(N, 3, -1)
+    
+    # 提取DC项（f_dc）和rest项（f_rest）
+    # DC项是第一个系数 [N, 3, 1]
+    f_dc = sh_coeffs[:, :, 0:1]  # [N, 3, 1]
+    # Rest项是剩余系数 [N, 3, (sh_degree+1)**2 - 1]
+    f_rest = sh_coeffs[:, :, 1:]  # [N, 3, (sh_degree+1)**2 - 1]
+    
+    # 将f_rest展平为 [N, 3*((sh_degree+1)**2 - 1)]
+    # 标准3DGS格式：f_rest按通道交错排列 [N, 3*((sh_degree+1)**2 - 1)]
+    # 例如：f_rest_0_r, f_rest_0_g, f_rest_0_b, f_rest_1_r, f_rest_1_g, f_rest_1_b, ...
+    f_rest_flat = f_rest.reshape(N, -1)  # [N, 3*((sh_degree+1)**2 - 1)]
+    
+    # 计算rest项数量
+    num_rest = f_rest_flat.shape[1]
+    
+    # 写入PLY文件
+    with open(filepath, 'wb') as f:
+        # PLY header
+        header = f"""ply
+format binary_little_endian 1.0
+element vertex {N}
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+"""
+        # 添加f_rest属性
+        for i in range(num_rest):
+            header += f"property float f_rest_{i}\n"
+        
+        header += f"""property float opacity
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+end_header
+"""
+        f.write(header.encode('ascii'))
+        
+        # 写入数据（二进制）
+        for i in range(N):
+            # x, y, z
+            f.write(struct.pack('fff', float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2])))
+            # nx, ny, nz (法向量，设为0)
+            f.write(struct.pack('fff', 0.0, 0.0, 0.0))
+            # f_dc (DC项，RGB三个值)
+            f.write(struct.pack('fff', float(f_dc[i, 0, 0]), float(f_dc[i, 1, 0]), float(f_dc[i, 2, 0])))
+            # f_rest
+            for j in range(num_rest):
+                f.write(struct.pack('f', float(f_rest_flat[i, j])))
+            # opacity
+            f.write(struct.pack('f', float(opacity[i])))
+            # scales
+            f.write(struct.pack('fff', float(scales[i, 0]), float(scales[i, 1]), float(scales[i, 2])))
+            # rotations
+            f.write(struct.pack('ffff', float(rotations[i, 0]), float(rotations[i, 1]), float(rotations[i, 2]), float(rotations[i, 3])))
+
+
+def save_multiview_pointcloud_epoch(model, sample_images, device, save_dir, epoch, 
+                                    sample_idx=0, downsample_ratio=2):
+    """
+    保存多视角时序点云（适配 [B, T, V, C, H, W] 格式）
+    
+    Args:
+        model: 模型实例
+        sample_images: 样本图像 [B, T, V, C, H, W]
+        device: 设备
+        save_dir: 保存目录
+        epoch: 当前epoch编号
+        sample_idx: 样本索引（batch中的第几个样本）
+        downsample_ratio: 下采样比例（减少点云数量）
+    """
+    model.eval()
+    B, T, V, C, H, W = sample_images.shape
+    
+    with torch.no_grad():
+        # 前向推理
+        predictions = model(sample_images)
+        
+        # 提取结果
+        depth = predictions.get('depth', None)  # [B, T, V, H, W] 或 [B, T, V, 1, H, W] 或 [B, T, V, H, W, 1]
+        pose_enc_list = predictions.get('pose_enc_list', None)  # list of [B, V, 9] 或 [B, V, 9]
+        
+        # 如果 depth 或 pose_enc_list 不存在，跳过保存
+        if depth is None or pose_enc_list is None:
+            print(f"Warning: depth or pose_enc_list not found in predictions, skipping pointcloud save for epoch {epoch+1}")
+            return
+        
+        # 处理 depth 形状
+        if len(depth.shape) == 6:
+            if depth.shape[3] == 1:
+                depth = depth.squeeze(3)  # [B, T, V, H, W]
+            elif depth.shape[5] == 1:
+                depth = depth.squeeze(5)  # [B, T, V, H, W]
+        elif len(depth.shape) == 5:
+            pass  # 已经是 [B, T, V, H, W]
+        else:
+            print(f"Warning: Unexpected depth shape {depth.shape}, skipping pointcloud save")
+            return
+        
+        # 处理 pose_enc_list
+        if isinstance(pose_enc_list, list):
+            if len(pose_enc_list) == 0:
+                print(f"Warning: pose_enc_list is empty, skipping pointcloud save")
+                return
+            pose_enc = pose_enc_list[-1]  # 使用最后一个迭代的结果 [B, V, 9]
+        else:
+            pose_enc = pose_enc_list  # [B, V, 9]
+        
+        # 转换为相机内外参
+        # pose_enc: [B, V, 9]
+        # 需要 reshape 为 [B*V, 9] 然后转换，再 reshape 回来
+        B_pose, V_pose, _ = pose_enc.shape
+        pose_enc_flat = pose_enc.reshape(B_pose * V_pose, 9)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            pose_enc_flat.unsqueeze(1),  # [B*V, 1, 9] - 需要添加时间维度
+            image_size_hw=(H, W)
+        )
+        # extrinsic: [B*V, 1, 3, 4], intrinsic: [B*V, 1, 3, 3]
+        extrinsic = extrinsic.squeeze(1)  # [B*V, 3, 4]
+        intrinsic = intrinsic.squeeze(1)  # [B*V, 3, 3]
+        extrinsic = extrinsic.reshape(B_pose, V_pose, 3, 4)  # [B, V, 3, 4]
+        intrinsic = intrinsic.reshape(B_pose, V_pose, 3, 3)  # [B, V, 3, 3]
+        
+        # 选择第一个batch样本
+        depth_b = depth[sample_idx]  # [T, V, H, W]
+        extrinsic_b = extrinsic[sample_idx]  # [V, 3, 4]
+        intrinsic_b = intrinsic[sample_idx]  # [V, 3, 3]
+        images_b = sample_images[sample_idx]  # [T, V, C, H, W]
+        
+        # 创建保存目录
+        epoch_dir = os.path.join(save_dir, f"epoch_{epoch+1:04d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # 对每个时间步和视角，生成并保存点云
+        all_world_points_list = []
+        all_colors_list = []
+        
+        for t in range(T):
+            for v in range(V):
+                depth_tv = depth_b[t, v]  # [H, W]
+                extrinsic_tv = extrinsic_b[v]  # [3, 4]
+                intrinsic_tv = intrinsic_b[v]  # [3, 3]
+                images_tv = images_b[t, v]  # [C, H, W]
+                
+                # 将深度图反投影到世界坐标
+                depth_tv_3d = depth_tv.unsqueeze(0)  # [1, H, W]
+                extrinsic_tv_3d = extrinsic_tv.unsqueeze(0)  # [1, 3, 4]
+                intrinsic_tv_3d = intrinsic_tv.unsqueeze(0)  # [1, 3, 3]
+                
+                world_points_tv = backproject_depth_to_points_batch(
+                    depth_tv_3d, intrinsic_tv_3d, extrinsic_tv_3d
+                )  # [1, H*W, 3]
+                world_points_tv = world_points_tv[0]  # [H*W, 3]
+                
+                # 获取颜色（图像）
+                images_tv_rgb = images_tv.permute(1, 2, 0)  # [H, W, C]
+                images_tv_flat = images_tv_rgb.reshape(H * W, C)  # [H*W, C]
+                
+                # 处理归一化到 [0, 1]
+                if images_tv_flat.min() < 0:
+                    images_tv_flat = (images_tv_flat + 1) / 2.0
+                images_tv_flat = images_tv_flat.clamp(0, 1)
+                
+                # 下采样
+                if downsample_ratio > 1:
+                    world_points_tv = world_points_tv[::downsample_ratio]
+                    images_tv_flat = images_tv_flat[::downsample_ratio]
+                
+                all_world_points_list.append(world_points_tv.cpu().numpy())
+                all_colors_list.append(images_tv_flat.cpu().numpy())
+                
+                # 单独保存每个视角、每个时间步的点云（可选）
+                # pcd_single = o3d.geometry.PointCloud()
+                # pcd_single.points = o3d.utility.Vector3dVector(world_points_tv.cpu().numpy())
+                # pcd_single.colors = o3d.utility.Vector3dVector(images_tv_flat.cpu().numpy())
+                # o3d.io.write_point_cloud(
+                #     f"{epoch_dir}/pointcloud_t{t:02d}_v{v:02d}.ply", pcd_single
+                # )
+        
+        # 合并所有视角和时间步的点云
+        all_world_points = np.concatenate(all_world_points_list, axis=0)  # [N_total, 3]
+        all_colors = np.concatenate(all_colors_list, axis=0)  # [N_total, C]
+        
+        # 保存合并的点云
+        pcd_merged = o3d.geometry.PointCloud()
+        pcd_merged.points = o3d.utility.Vector3dVector(all_world_points)
+        pcd_merged.colors = o3d.utility.Vector3dVector(all_colors)
+        o3d.io.write_point_cloud(f"{epoch_dir}/pointcloud_merged.ply", pcd_merged)
+        
+        # 保存相机内外参
+        ext_dict = {}
+        int_dict = {}
+        for v in range(V):
+            ext_dict[f'view_{v:02d}'] = extrinsic_b[v].cpu().numpy().tolist()
+            int_dict[f'view_{v:02d}'] = intrinsic_b[v].cpu().numpy().tolist()
+        
+        with open(f"{epoch_dir}/extrinsics.json", "w") as f:
+            json.dump(ext_dict, f, indent=4, cls=NumpyEncoder)
+        with open(f"{epoch_dir}/intrinsics.json", "w") as f:
+            json.dump(int_dict, f, indent=4, cls=NumpyEncoder)
+        
+        print(f"  ✅ Saved pointcloud for epoch {epoch+1} to {epoch_dir}/pointcloud_merged.ply")
+    
+    model.train()  # 恢复训练模式
+
+
+def save_comprehensive_results_epoch(model, sample_images, device, save_dir, epoch, 
+                                     sample_idx=0, downsample_ratio=2):
+    """
+    综合保存函数：保存原始图像大图、深度大图、GS渲染结果大图、点云文件夹、体素文件夹、GS文件夹
+    
+    Args:
+        model: 模型实例
+        sample_images: 样本图像 [B, T, V, C, H, W]
+        device: 设备
+        save_dir: 保存目录
+        epoch: 当前epoch编号
+        sample_idx: 样本索引（batch中的第几个样本）
+        downsample_ratio: 点云下采样比例
+    """
+    model.eval()
+    B, T, V, C, H, W = sample_images.shape
+    
+    with torch.no_grad():
+        # 前向推理
+        predictions = model(sample_images)
+        
+        # 提取结果
+        depth = predictions.get('depth', None)
+        pose_enc_list = predictions.get('pose_enc_list', None)
+        voxel_data = predictions.get('voxel_data', None)
+        rendered_images = predictions.get('rendered_images', None)  # GS渲染结果
+        rendered_depth = predictions.get('rendered_depth', None)
+        
+        # GS参数
+        fused_gaussian_xyz = predictions.get('fused_gaussian_xyz', None)  # [B, T, N, 3]
+        fused_gaussian_opacity = predictions.get('fused_gaussian_opacity', None)  # [B, T, N]
+        fused_gaussian_scales = predictions.get('fused_gaussian_scales', None)  # [B, T, N, 3]
+        fused_gaussian_rotations = predictions.get('fused_gaussian_rotations', None)  # [B, T, N, 4]
+        fused_gaussian_sh_coeffs = predictions.get('fused_gaussian_sh_coeffs', None)  # [B, T, N, 3, 48] or [B, T, N, 144]
+        
+        # 选择第一个batch样本
+        images_b = sample_images[sample_idx]  # [T, V, C, H, W]
+        if depth is not None:
+            # 处理depth形状
+            if len(depth.shape) == 6:
+                if depth.shape[3] == 1:
+                    depth = depth.squeeze(3)  # [B, T, V, H, W]
+                elif depth.shape[5] == 1:
+                    depth = depth.squeeze(5)  # [B, T, V, H, W]
+            depth_b = depth[sample_idx]  # [T, V, H, W]
+        else:
+            depth_b = None
+        
+        # 创建保存目录
+        epoch_dir = os.path.join(save_dir, f"epoch_{epoch+1:04d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # ========== 1. 保存原始图像大图（V行*T列） ==========
+        try:
+            # images_b: [T, V, C, H, W]
+            # 排列成V行T列的大图
+            image_rows = []
+            for v in range(V):
+                image_cols = []
+                for t in range(T):
+                    img_tv = images_b[t, v]  # [C, H, W]
+                    # 转换为numpy并归一化到[0, 255]
+                    img_np = img_tv.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                    if img_np.min() < 0:
+                        img_np = (img_np + 1) / 2.0
+                    img_np = np.clip(img_np, 0, 1)
+                    img_np = (img_np * 255).astype(np.uint8)
+                    image_cols.append(img_np)
+                # 水平拼接：T列
+                row_img = np.concatenate(image_cols, axis=1)  # [H, T*W, C]
+                image_rows.append(row_img)
+            # 垂直拼接：V行
+            big_image = np.concatenate(image_rows, axis=0)  # [V*H, T*W, C]
+            
+            # 保存为图像
+            big_image_pil = Image.fromarray(big_image)
+            big_image_pil.save(f"{epoch_dir}/images_grid.png")
+            print(f"  ✅ Saved images grid to {epoch_dir}/images_grid.png")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Failed to save images grid: {e}")
+        
+        # ========== 2. 保存深度大图（V行*T列） ==========
+        if depth_b is not None:
+            try:
+                # depth_b: [T, V, H, W]
+                # 排列成V行T列的大图
+                depth_rows = []
+                for v in range(V):
+                    depth_cols = []
+                    for t in range(T):
+                        depth_tv = depth_b[t, v]  # [H, W]
+                        depth_np = depth_tv.cpu().numpy()
+                        
+                        # 归一化到[0, 1]用于可视化
+                        depth_min = depth_np.min()
+                        depth_max = depth_np.max()
+                        if depth_max > depth_min:
+                            depth_normalized = (depth_np - depth_min) / (depth_max - depth_min)
+                        else:
+                            depth_normalized = depth_np
+                        
+                        # 转换为RGB（使用colormap）
+                        depth_colored = plt.cm.viridis(depth_normalized)[:, :, :3]  # [H, W, 3]
+                        depth_colored = (depth_colored * 255).astype(np.uint8)
+                        depth_cols.append(depth_colored)
+                    # 水平拼接
+                    row_depth = np.concatenate(depth_cols, axis=1)  # [H, T*W, 3]
+                    depth_rows.append(row_depth)
+                # 垂直拼接
+                big_depth = np.concatenate(depth_rows, axis=0)  # [V*H, T*W, 3]
+                
+                # 保存为图像
+                big_depth_pil = Image.fromarray(big_depth)
+                big_depth_pil.save(f"{epoch_dir}/depth_grid.png")
+                print(f"  ✅ Saved depth grid to {epoch_dir}/depth_grid.png")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to save depth grid: {e}")
+        
+        # ========== 3. 保存GS渲染结果大图（V行*T列） ==========
+        if rendered_images is not None:
+            try:
+                # rendered_images: [B, T, V, C, H, W] 或 [B, T*V, C, H, W] 或 [B, V, T, C, H, W]
+                rendered_b = rendered_images[sample_idx]  # [T, V, C, H, W] 或 [T*V, C, H, W] 或 [V, T, C, H, W]
+                
+                # 处理形状
+                if len(rendered_b.shape) == 4:
+                    # [T*V, C, H, W] -> [T, V, C, H, W]
+                    rendered_b = rendered_b.reshape(T, V, C, H, W)
+                elif len(rendered_b.shape) == 5:
+                    # 检查是否是 [V, T, C, H, W]
+                    if rendered_b.shape[0] == V and rendered_b.shape[1] == T:
+                        # [V, T, C, H, W] -> [T, V, C, H, W]
+                        rendered_b = rendered_b.permute(1, 0, 2, 3, 4)
+                
+                # 排列成V行T列的大图
+                render_rows = []
+                for v in range(V):
+                    render_cols = []
+                    for t in range(T):
+                        render_tv = rendered_b[t, v]  # [C, H, W]
+                        render_np = render_tv.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                        render_np = np.clip(render_np, 0, 1)
+                        render_np = (render_np * 255).astype(np.uint8)
+                        render_cols.append(render_np)
+                    row_render = np.concatenate(render_cols, axis=1)  # [H, T*W, C]
+                    render_rows.append(row_render)
+                big_render = np.concatenate(render_rows, axis=0)  # [V*H, T*W, C]
+                
+                big_render_pil = Image.fromarray(big_render)
+                big_render_pil.save(f"{epoch_dir}/rendered_grid.png")
+                print(f"  ✅ Saved rendered grid to {epoch_dir}/rendered_grid.png")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to save rendered grid: {e}")
+        
+        # ========== 4. 保存点云文件夹（每个时刻一个文件） ==========
+        if depth is not None and pose_enc_list is not None:
+            try:
+                # 处理pose_enc_list
+                if isinstance(pose_enc_list, list):
+                    if len(pose_enc_list) == 0:
+                        pose_enc = None
+                    else:
+                        pose_enc = pose_enc_list[-1]  # [B, V, 9]
+                else:
+                    pose_enc = pose_enc_list  # [B, V, 9]
+                
+                if pose_enc is not None:
+                    # 转换为相机内外参
+                    B_pose, V_pose, _ = pose_enc.shape
+                    pose_enc_flat = pose_enc.reshape(B_pose * V_pose, 9)
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+                        pose_enc_flat.unsqueeze(1),
+                        image_size_hw=(H, W)
+                    )
+                    extrinsic = extrinsic.squeeze(1).reshape(B_pose, V_pose, 3, 4)
+                    intrinsic = intrinsic.squeeze(1).reshape(B_pose, V_pose, 3, 3)
+                    
+                    extrinsic_b = extrinsic[sample_idx]  # [V, 3, 4]
+                    intrinsic_b = intrinsic[sample_idx]  # [V, 3, 3]
+                    
+                    # 创建点云文件夹
+                    pointcloud_dir = os.path.join(epoch_dir, "pointclouds")
+                    os.makedirs(pointcloud_dir, exist_ok=True)
+                    
+                    # 为每个时刻保存点云
+                    for t in range(T):
+                        all_world_points_list = []
+                        all_colors_list = []
+                        
+                        for v in range(V):
+                            depth_tv = depth_b[t, v]  # [H, W]
+                            extrinsic_tv = extrinsic_b[v]  # [3, 4]
+                            intrinsic_tv = intrinsic_b[v]  # [3, 3]
+                            images_tv = images_b[t, v]  # [C, H, W]
+                            
+                            # 反投影到世界坐标
+                            world_points_tv = backproject_depth_to_points_batch(
+                                depth_tv.unsqueeze(0), intrinsic_tv.unsqueeze(0), extrinsic_tv.unsqueeze(0)
+                            )[0]  # [H*W, 3]
+                            
+                            # 获取颜色
+                            images_tv_rgb = images_tv.permute(1, 2, 0)  # [H, W, C]
+                            images_tv_flat = images_tv_rgb.reshape(H * W, C)  # [H*W, C]
+                            
+                            # 归一化到[0, 1]
+                            if images_tv_flat.min() < 0:
+                                images_tv_flat = (images_tv_flat + 1) / 2.0
+                            images_tv_flat = images_tv_flat.clamp(0, 1)
+                            
+                            # 下采样
+                            if downsample_ratio > 1:
+                                world_points_tv = world_points_tv[::downsample_ratio]
+                                images_tv_flat = images_tv_flat[::downsample_ratio]
+                            
+                            all_world_points_list.append(world_points_tv.cpu().numpy())
+                            all_colors_list.append(images_tv_flat.cpu().numpy())
+                        
+                        # 合并该时刻的所有视角点云
+                        if all_world_points_list:
+                            all_world_points = np.concatenate(all_world_points_list, axis=0)
+                            all_colors = np.concatenate(all_colors_list, axis=0)
+                            
+                            pcd_t = o3d.geometry.PointCloud()
+                            pcd_t.points = o3d.utility.Vector3dVector(all_world_points)
+                            pcd_t.colors = o3d.utility.Vector3dVector(all_colors)
+                            o3d.io.write_point_cloud(f"{pointcloud_dir}/pointcloud_t{t:04d}.ply", pcd_t)
+                    
+                    print(f"  ✅ Saved pointclouds to {pointcloud_dir}/")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to save pointclouds: {e}")
+        
+        # ========== 5. 保存体素文件夹（可用软件查看的格式） ==========
+        if voxel_data is not None:
+            try:
+                voxel_dir = os.path.join(epoch_dir, "voxels")
+                os.makedirs(voxel_dir, exist_ok=True)
+                
+                voxel_xyz_list = voxel_data.get('voxel_xyz_list', None)
+                voxel_ids_list = voxel_data.get('voxel_ids_list', None)
+                
+                if voxel_xyz_list is not None:
+                    # 为每个时刻保存体素点云（PLY格式，可用Meshlab等查看）
+                    for t in range(T):
+                        if t < len(voxel_xyz_list) and voxel_xyz_list[t] is not None:
+                            if isinstance(voxel_xyz_list[t], list) and len(voxel_xyz_list[t]) > sample_idx:
+                                voxel_xyz_t = voxel_xyz_list[t][sample_idx]  # [N_voxels, 3]
+                                
+                                if torch.is_tensor(voxel_xyz_t):
+                                    voxel_xyz_np = voxel_xyz_t.cpu().numpy()
+                                else:
+                                    voxel_xyz_np = voxel_xyz_t
+                                
+                                # 创建点云用于可视化
+                                pcd_voxel = o3d.geometry.PointCloud()
+                                pcd_voxel.points = o3d.utility.Vector3dVector(voxel_xyz_np)
+                                # 设置为红色以便区分
+                                colors = np.ones_like(voxel_xyz_np) * [1.0, 0.0, 0.0]
+                                pcd_voxel.colors = o3d.utility.Vector3dVector(colors)
+                                o3d.io.write_point_cloud(f"{voxel_dir}/voxels_t{t:04d}.ply", pcd_voxel)
+                                
+                                # 同时保存为npz（包含完整信息）
+                                voxel_ids_t = None
+                                if voxel_ids_list is not None and t < len(voxel_ids_list):
+                                    if isinstance(voxel_ids_list[t], list) and len(voxel_ids_list[t]) > sample_idx:
+                                        voxel_ids_t = voxel_ids_list[t][sample_idx]
+                                
+                                save_data = {'xyz': voxel_xyz_np}
+                                if voxel_ids_t is not None:
+                                    if torch.is_tensor(voxel_ids_t):
+                                        save_data['ids'] = voxel_ids_t.cpu().numpy()
+                                    else:
+                                        save_data['ids'] = voxel_ids_t
+                                np.savez(f"{voxel_dir}/voxels_t{t:04d}.npz", **save_data)
+                    
+                    print(f"  ✅ Saved voxels to {voxel_dir}/")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to save voxels: {e}")
+        
+        # ========== 6. 保存GS文件夹（每个时刻的PLY文件） ==========
+        if (fused_gaussian_xyz is not None and 
+            fused_gaussian_opacity is not None and 
+            fused_gaussian_scales is not None and 
+            fused_gaussian_rotations is not None and 
+            fused_gaussian_sh_coeffs is not None):
+            try:
+                gs_dir = os.path.join(epoch_dir, "gaussians")
+                os.makedirs(gs_dir, exist_ok=True)
+                
+                # 提取batch样本
+                xyz_b = fused_gaussian_xyz[sample_idx]  # [T, N, 3]
+                opacity_b = fused_gaussian_opacity[sample_idx]  # [T, N]
+                scales_b = fused_gaussian_scales[sample_idx]  # [T, N, 3]
+                rotations_b = fused_gaussian_rotations[sample_idx]  # [T, N, 4]
+                sh_coeffs_b = fused_gaussian_sh_coeffs[sample_idx]  # [T, N, 3, 48] or [T, N, 144]
+                
+                # 为每个时刻保存GS PLY文件
+                for t in range(T):
+                    xyz_t = xyz_b[t]  # [N, 3]
+                    opacity_t = opacity_b[t]  # [N]
+                    scales_t = scales_b[t]  # [N, 3]
+                    rotations_t = rotations_b[t]  # [N, 4]
+                    sh_coeffs_t = sh_coeffs_b[t]  # [N, 3, 48] or [N, 144]
+                    
+                    # 处理sh_coeffs形状
+                    if len(sh_coeffs_t.shape) == 2:
+                        # [N, 144] -> [N, 3, 48]
+                        sh_coeffs_t = sh_coeffs_t.reshape(-1, 3, 48)
+                    
+                    # 保存PLY文件
+                    ply_path = f"{gs_dir}/gaussians_t{t:04d}.ply"
+                    save_gaussian_ply(
+                        xyz_t, opacity_t, scales_t, rotations_t, sh_coeffs_t,
+                        ply_path, sh_degree=3
+                    )
+                
+                print(f"  ✅ Saved Gaussian Splatting files to {gs_dir}/")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to save Gaussian Splatting files: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    model.train()  # 恢复训练模式
+
+
+def save_gaussian_splatting_epoch(model, sample_images, device, save_dir, epoch, sample_idx=0):
+    """
+    保存高斯Splatting参数并进行多视角渲染（参考AnySplat实现）
+    
+    Args:
+        model: 模型实例（需要包含 gaussian_param_head）
+        sample_images: 样本图像 [B, T, V, C, H, W]
+        device: 设备
+        save_dir: 保存目录
+        epoch: 当前epoch编号
+        sample_idx: 样本索引（batch中的第几个样本）
+    """
+    model.eval()
+    B, T, V, C, H, W = sample_images.shape
+    
+    with torch.no_grad():
+        # 前向推理
+        predictions = model(sample_images)
+        
+        # 提取gaussian参数（如果存在）
+        gaussian_params = predictions.get('gaussian_params', None)
+        depth = predictions.get('depth', None)
+        pose_enc_list = predictions.get('pose_enc_list', None)
+        
+        # 处理 depth 形状
+        if depth is not None:
+            if len(depth.shape) == 6:
+                if depth.shape[3] == 1:
+                    depth = depth.squeeze(3)  # [B, T, V, H, W]
+                elif depth.shape[5] == 1:
+                    depth = depth.squeeze(5)  # [B, T, V, H, W]
+        
+        # 处理 pose_enc_list
+        if pose_enc_list is not None:
+            if isinstance(pose_enc_list, list):
+                if len(pose_enc_list) > 0:
+                    pose_enc = pose_enc_list[-1]  # [B, V, 9]
+                else:
+                    pose_enc = None
+            else:
+                pose_enc = pose_enc_list
+        else:
+            pose_enc = None
+        
+        # 选择第一个batch样本
+        gaussian_params_b = gaussian_params[sample_idx]  # [T, V, output_dim, H, W]
+        if depth is not None:
+            depth_b = depth[sample_idx]  # [T, V, H, W]
+        else:
+            depth_b = None
+            
+        # 创建保存目录
+        epoch_dir = os.path.join(save_dir, f"epoch_{epoch+1:04d}_gaussians")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # 保存gaussian参数（原始格式）
+        # gaussian_params_b: [T, V, output_dim, H, W]
+        gaussian_params_np = gaussian_params_b.cpu().numpy()
+        
+        # 保存为numpy文件
+        np.save(f"{epoch_dir}/gaussian_params.npy", gaussian_params_np)
+        
+        # 同时保存元数据
+        metadata = {
+            'epoch': epoch + 1,
+            'shape': gaussian_params_b.shape,
+            'T': T,
+            'V': V,
+            'H': H,
+            'W': W,
+            'output_dim': gaussian_params_b.shape[2]
+        }
+        with open(f"{epoch_dir}/metadata.json", "w") as f:
+            json.dump(metadata, f, indent=4, cls=NumpyEncoder)
+        
+        print(f"  ✅ Saved Gaussian parameters for epoch {epoch+1} to {epoch_dir}/")
+        print(f"     Shape: {gaussian_params_b.shape}, dtype: {gaussian_params_b.dtype}")
+    
+    model.train()  # 恢复训练模式
+
+
 class MultiViewTemporalDataset(Dataset):
     """
     多视角时序数据Dataset，支持数据增强和SegAnyMo监督：
@@ -83,15 +729,20 @@ class MultiViewTemporalDataset(Dataset):
     3. 可选的帧内数据增强（颜色抖动、轻微旋转等）
     4. SegAnyMo mask监督（从sam2/mask_frames或sam2/initial_preds加载）
     """
-    def __init__(self, images_dir, seganymo_dir=None, target_size=378, mode="crop", 
+    def __init__(self, images_dir, seganymo_dir=None, depths_dir=None, intrinsics_dir=None, extrinsics_dir=None,
+                 target_size=378, mode="crop", 
                  T_window_sizes=[6, 8], enable_view_permutation=True,
                  enable_temporal_slice=True, enable_intra_frame_aug=False,
                  use_seganymo_mask=True, mask_source="sam2/mask_frames",
-                 train=True):
+                 load_depth=True, load_cameras=True,
+                 train=True, dataset_length=100):
         """
         Args:
             images_dir: 图像数据目录路径，例如 "data/images"
             seganymo_dir: SegAnyMo数据目录路径，例如 "data/SegAnyMo"，如果为None则不加载mask
+            depths_dir: 深度数据目录路径，例如 "data/depths"，如果为None则不加载深度
+            intrinsics_dir: 内参数据目录路径，例如 "data/intrs"，如果为None则不加载内参
+            extrinsics_dir: 外参数据目录路径，例如 "data/extrs"，如果为None则不加载外参
             target_size: 目标图像尺寸，默认 378
             mode: 预处理模式，"crop" 或 "pad"
             T_window_sizes: 时序窗口大小列表，例如 [6, 12, 18, 24]
@@ -100,10 +751,18 @@ class MultiViewTemporalDataset(Dataset):
             enable_intra_frame_aug: 是否启用帧内数据增强（颜色抖动、旋转等）
             use_seganymo_mask: 是否加载SegAnyMo mask作为监督
             mask_source: mask来源，"sam2/mask_frames" 或 "sam2/initial_preds"
+            load_depth: 是否加载深度图，默认True
+            load_cameras: 是否加载相机参数（内外参），默认True
             train: 是否为训练模式（影响数据增强的随机性）
+            dataset_length: Dataset长度（用于过拟合场景），默认100
         """
         self.images_dir = os.path.abspath(images_dir)
         self.seganymo_dir = os.path.abspath(seganymo_dir) if seganymo_dir else None
+        self.depths_dir = os.path.abspath(depths_dir) if depths_dir else None
+        self.intrinsics_dir = os.path.abspath(intrinsics_dir) if intrinsics_dir else None
+        self.extrinsics_dir = os.path.abspath(extrinsics_dir) if extrinsics_dir else None
+        self.load_depth = load_depth and (depths_dir is not None)
+        self.load_cameras = load_cameras and (intrinsics_dir is not None and extrinsics_dir is not None)
         self.target_size = target_size
         self.mode = mode
         self.T_window_sizes = T_window_sizes if isinstance(T_window_sizes, list) else [T_window_sizes]
@@ -113,6 +772,7 @@ class MultiViewTemporalDataset(Dataset):
         self.use_seganymo_mask = use_seganymo_mask and (seganymo_dir is not None)
         self.mask_source = mask_source
         self.train = train
+        self.dataset_length = dataset_length
         
         if not os.path.exists(self.images_dir):
             raise ValueError(f"Images directory does not exist: {self.images_dir}")
@@ -189,11 +849,13 @@ class MultiViewTemporalDataset(Dataset):
         print(f"  Temporal slice: {enable_temporal_slice} (window sizes: {self.T_window_sizes})")
         print(f"  Intra-frame aug: {enable_intra_frame_aug}")
         print(f"  SegAnyMo mask: {self.use_seganymo_mask} (source: {mask_source if self.use_seganymo_mask else 'N/A'})")
+        print(f"  Load depth: {self.load_depth}")
+        print(f"  Load cameras: {self.load_cameras}")
     
     def __len__(self):
         # 对于过拟合场景，可以返回一个较大的数字，每次访问都会随机增强
         # 或者返回固定的样本数（例如1000）
-        return 1000  # 可以根据需要调整
+        return self.dataset_length  # 可以根据需要调整
     
     def load_image(self, img_path):
         """加载并预处理单张图像"""
@@ -273,10 +935,73 @@ class MultiViewTemporalDataset(Dataset):
         
         return mask_tensor  # [H, W], 值域[0, 1]
     
+    def _load_depth_file(self, depth_path):
+        """加载深度图（numpy格式）"""
+        depth_np = np.load(depth_path)  # [H, W] 或 [H, W, 1]
+        
+        # 处理维度
+        if len(depth_np.shape) == 3:
+            depth_np = depth_np.squeeze(-1)  # [H, W]
+        
+        # 转换为tensor
+        depth_tensor = torch.from_numpy(depth_np).float()  # [H_orig, W_orig]
+        
+        # Resize到target_size
+        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, H_orig, W_orig]
+        depth_tensor = torch.nn.functional.interpolate(
+            depth_tensor,
+            size=(self.target_size, self.target_size),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0).squeeze(0)  # [H, W]
+        
+        return depth_tensor  # [H, W]
+    
+    def load_intrinsics(self, intrinsics_path):
+        """加载内参（numpy格式，3x3矩阵）"""
+        intrinsics_np = np.load(intrinsics_path)  # [3, 3]
+        
+        # 确保是3x3矩阵
+        if intrinsics_np.shape != (3, 3):
+            if intrinsics_np.shape == (9,):
+                intrinsics_np = intrinsics_np.reshape(3, 3)
+            else:
+                raise ValueError(f"Invalid intrinsics shape: {intrinsics_np.shape}, expected (3, 3)")
+        
+        # 转换为tensor
+        intrinsics_tensor = torch.from_numpy(intrinsics_np).float()  # [3, 3]
+        
+        return intrinsics_tensor  # [3, 3]
+    
+    def load_extrinsics(self, extrinsics_path):
+        """加载外参（numpy格式，3x4矩阵）"""
+        extrinsics_np = np.load(extrinsics_path)  # [3, 4] 或 [4, 4]
+        
+        # 处理维度
+        if extrinsics_np.shape == (4, 4):
+            extrinsics_np = extrinsics_np[:3, :]  # 取前3行 [3, 4]
+        elif extrinsics_np.shape == (3, 4):
+            pass  # 已经是正确格式
+        elif extrinsics_np.shape == (12,):
+            extrinsics_np = extrinsics_np.reshape(3, 4)
+        else:
+            raise ValueError(f"Invalid extrinsics shape: {extrinsics_np.shape}, expected (3, 4) or (4, 4)")
+        
+        # 转换为tensor
+        extrinsics_tensor = torch.from_numpy(extrinsics_np).float()  # [3, 4]
+        
+        return extrinsics_tensor  # [3, 4]
+    
     def __getitem__(self, idx):
         """
-        返回一个batch的数据：[T, V, C, H, W], [T, V, H, W]
-        注意：Dataset返回的是 [T, V, C, H, W] 和 [T, V, H, W]，DataLoader会自动添加batch维度
+        返回一个batch的数据：
+        - images: [T, V, C, H, W]
+        - masks: [T, V, H, W] (可选)
+        - depths: [T, V, H, W] (可选)
+        - intrinsics: [T, V, 3, 3] (可选)
+        - extrinsics: [T, V, 3, 4] (可选)
+        
+        注意：Dataset返回的是 [T, V, ...]，DataLoader会自动添加batch维度
         """
         # 1. 时序随机切片（如果启用）
         if self.enable_temporal_slice and self.train:
@@ -307,21 +1032,75 @@ class MultiViewTemporalDataset(Dataset):
             permuted_view_files = self.view_files
             permuted_view_indices = [int(re.search(r'view(\d+)', f).group(1)) for f in permuted_view_files]
         
-        # 3. 加载所有图像
+        # 3. 加载所有图像、深度、内外参和mask
         images_list = []
         masks_list = [] if self.use_seganymo_mask else None
+        depths_list = [] if self.load_depth else None
+        intrinsics_list = [] if self.load_cameras else None
+        extrinsics_list = [] if self.load_cameras else None
         
         for t_idx, time_dir in zip(selected_time_indices, selected_time_dirs):
             time_images = []
             time_masks = [] if self.use_seganymo_mask else None
+            time_depths = [] if self.load_depth else None
+            time_intrinsics = [] if self.load_cameras else None
+            time_extrinsics = [] if self.load_cameras else None
+            
+            # 获取时间目录名（例如 "time_00"）
+            time_dir_name = os.path.basename(time_dir)
             
             for v_idx, v_file in zip(permuted_view_indices, permuted_view_files):
+                # 加载图像
                 img_path = os.path.join(time_dir, v_file)
                 if not os.path.exists(img_path):
                     raise ValueError(f"Image not found: {img_path}")
                 
                 img = self.load_image(img_path)  # [C, H, W]
                 time_images.append(img)
+                
+                # 加载深度图（如果启用）
+                if self.load_depth:
+                    depth_path = os.path.join(self.depths_dir, time_dir_name, f"view{v_idx}.npy")
+                    if os.path.exists(depth_path):
+                        depth = self._load_depth_file(depth_path)  # [H, W]
+                        time_depths.append(depth)
+                    else:
+                        # 如果深度不存在，创建零深度
+                        depth = torch.zeros(self.target_size, self.target_size)
+                        time_depths.append(depth)
+                
+                # 加载内参（如果启用）
+                if self.load_cameras:
+                    intrinsics_path = os.path.join(self.intrinsics_dir, time_dir_name, f"view{v_idx}.npy")
+                    if os.path.exists(intrinsics_path):
+                        intrinsics = self.load_intrinsics(intrinsics_path)  # [3, 3]
+                        time_intrinsics.append(intrinsics)
+                    else:
+                        # 如果内参不存在，创建默认内参（基于target_size）
+                        # 假设FOV约为60度，使用简单的针孔相机模型
+                        f = self.target_size / (2.0 * np.tan(np.radians(30)))
+                        cx = cy = self.target_size / 2.0
+                        default_intrinsics = torch.tensor([
+                            [f, 0, cx],
+                            [0, f, cy],
+                            [0, 0, 1]
+                        ], dtype=torch.float32)
+                        time_intrinsics.append(default_intrinsics)
+                
+                # 加载外参（如果启用）
+                if self.load_cameras:
+                    extrinsics_path = os.path.join(self.extrinsics_dir, time_dir_name, f"view{v_idx}.npy")
+                    if os.path.exists(extrinsics_path):
+                        extrinsics = self.load_extrinsics(extrinsics_path)  # [3, 4]
+                        time_extrinsics.append(extrinsics)
+                    else:
+                        # 如果外参不存在，创建单位外参（假设相机在原点）
+                        default_extrinsics = torch.tensor([
+                            [1, 0, 0, 0],
+                            [0, 1, 0, 0],
+                            [0, 0, 1, 0]
+                        ], dtype=torch.float32)
+                        time_extrinsics.append(default_extrinsics)
                 
                 # 加载对应的mask（如果启用）
                 if self.use_seganymo_mask and self.mask_paths is not None:
@@ -345,6 +1124,12 @@ class MultiViewTemporalDataset(Dataset):
             images_list.append(time_images)
             if self.use_seganymo_mask and time_masks is not None:
                 masks_list.append(time_masks)
+            if self.load_depth and time_depths is not None:
+                depths_list.append(time_depths)
+            if self.load_cameras and time_intrinsics is not None:
+                intrinsics_list.append(time_intrinsics)
+            if self.load_cameras and time_extrinsics is not None:
+                extrinsics_list.append(time_extrinsics)
         
         # 转换为张量 [T, V, C, H, W]
         images_tensor = torch.stack([torch.stack(time_imgs) for time_imgs in images_list])
@@ -370,12 +1155,31 @@ class MultiViewTemporalDataset(Dataset):
             
             images_tensor = images_padded
         
-        # 返回图像和mask
+        # 构建返回字典
+        result = {
+            'images': images_tensor,  # [T, V, C, H, W]
+        }
+        
+        # 添加mask
         if self.use_seganymo_mask and masks_list is not None:
             masks_tensor = torch.stack([torch.stack(time_masks) for time_masks in masks_list])  # [T, V, H, W]
-            return images_tensor, masks_tensor
-        else:
-            return images_tensor, None
+            result['masks'] = masks_tensor
+        
+        # 添加深度
+        if self.load_depth and depths_list is not None:
+            depths_tensor = torch.stack([torch.stack(time_depths) for time_depths in depths_list])  # [T, V, H, W]
+            result['depths'] = depths_tensor
+        
+        # 添加内外参
+        if self.load_cameras:
+            if intrinsics_list is not None:
+                intrinsics_tensor = torch.stack([torch.stack(time_intrinsics) for time_intrinsics in intrinsics_list])  # [T, V, 3, 3]
+                result['intrinsics'] = intrinsics_tensor
+            if extrinsics_list is not None:
+                extrinsics_tensor = torch.stack([torch.stack(time_extrinsics) for time_extrinsics in extrinsics_list])  # [T, V, 3, 4]
+                result['extrinsics'] = extrinsics_tensor
+        
+        return result
 
 
 def load_time_view_images(images_dir, target_size=378, mode="crop"):
@@ -387,17 +1191,24 @@ def load_time_view_images(images_dir, target_size=378, mode="crop"):
     dataset = MultiViewTemporalDataset(
         images_dir=images_dir,
         seganymo_dir=None,
+        depths_dir=None,
+        intrinsics_dir=None,
+        extrinsics_dir=None,
         target_size=target_size,
         mode=mode,
         enable_view_permutation=False,
         enable_temporal_slice=False,
         enable_intra_frame_aug=False,
         use_seganymo_mask=False,
-        train=False
+        load_depth=False,
+        load_cameras=False,
+        train=False,
+        dataset_length=100  # 默认值，用于推理
     )
     
     # 返回第一个样本（所有帧，无增强）
-    images_tensor, _ = dataset[0]
+    result = dataset[0]
+    images_tensor = result['images']  # [T, V, C, H, W]
     
     metadata = {
         'T': images_tensor.shape[0],
@@ -785,6 +1596,7 @@ def print_model_structure(model, max_depth=3, indent=0):
 def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True):
     """
     加载预训练权重，处理形状不匹配问题
+    支持 .pt, .pth, .safetensors 格式
     
     Args:
         model: PyTorch模型
@@ -793,7 +1605,7 @@ def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True)
         verbose: 是否打印详细信息
     
     Returns:
-        dict: 包含加载统计信息的字典
+        dict: 包含加载统计信息的字典，包括 GS Head 加载状态
     """
     import os
     
@@ -804,13 +1616,32 @@ def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True)
             'loaded': False,
             'missing_keys': [],
             'unexpected_keys': [],
-            'size_mismatch_keys': []
+            'size_mismatch_keys': [],
+            'gs_head_loaded': False
         }
     
     if verbose:
         print(f"Loading checkpoint from {checkpoint_path}...")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Check if it's a safetensors file
+    if checkpoint_path.endswith('.safetensors'):
+        try:
+            from safetensors.torch import load_file
+            state_dict = load_file(checkpoint_path, device=device)
+            # Convert safetensors dict to standard format
+            checkpoint = {'model': state_dict}
+            if verbose:
+                print("  Loaded safetensors format")
+        except ImportError:
+            if verbose:
+                print("  Warning: safetensors library not available, trying torch.load...")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+        except Exception as e:
+            if verbose:
+                print(f"  Warning: Failed to load safetensors ({e}), trying torch.load...")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Check checkpoint format
     if isinstance(checkpoint, dict):
@@ -850,9 +1681,22 @@ def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True)
     # 加载过滤后的权重
     missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
     
+    # 检测 GS Head 权重是否成功加载
+    gs_head_keys = [k for k in filtered_state_dict.keys() if 'gaussian_param_head' in k]
+    gs_head_loaded = len(gs_head_keys) > 0
+    
     if verbose:
         print(f"Loaded checkpoint from {checkpoint_path}")
         print(f"  Successfully loaded: {len(filtered_state_dict)} keys")
+        
+        # GS Head 加载状态
+        if gs_head_loaded:
+            print(f"  ✓ GS Head weights loaded: {len(gs_head_keys)} keys")
+            if verbose and len(gs_head_keys) <= 10:
+                for k in gs_head_keys:
+                    print(f"    - {k}")
+        else:
+            print(f"  ⚠ GS Head weights not found in checkpoint (will use random initialization)")
         
         if size_mismatch_keys:
             print(f"  Size mismatch (skipped): {len(size_mismatch_keys)} keys")
@@ -872,8 +1716,13 @@ def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True)
             
             for module, keys in missing_by_module.items():
                 print(f"    [{module}]: {len(keys)} keys")
-                for k in keys:
-                    print(f"      - {k}")
+                if len(keys) <= 5:
+                    for k in keys:
+                        print(f"      - {k}")
+                else:
+                    for k in keys[:3]:
+                        print(f"      - {k}")
+                    print(f"      ... and {len(keys) - 3} more")
 
         
         if unexpected_keys:
@@ -891,7 +1740,9 @@ def load_pretrained_weights(model, checkpoint_path, device="cuda", verbose=True)
         'loaded_keys': len(filtered_state_dict),
         'missing_keys': missing_keys,
         'unexpected_keys': unexpected_keys,
-        'size_mismatch_keys': size_mismatch_keys
+        'size_mismatch_keys': size_mismatch_keys,
+        'gs_head_loaded': gs_head_loaded,
+        'gs_head_keys': gs_head_keys
     }
 
 
@@ -1008,7 +1859,9 @@ def apply_freeze_train_strategy_precise(model):
     
     # 1.2 Stage-1 (8层: 0-7) & Stage-3 (6层: 18-23) 的所有 Transformer 层参数
     # Stage-1: frame_blocks[0:8], global_blocks[0:8]
-    stage1_indices = list(range(0, 8))
+    # 修改：解冻Stage-1后4层（4-7）用于学习跨视证据合并
+    stage1_indices = list(range(0, 4))  # 前4层冻结
+    stage1_partial = list(range(4, 8))  # 后4层解冻
     for idx in stage1_indices:
         if idx < len(aggregator.frame_blocks):
             for param in aggregator.frame_blocks[idx].parameters():
@@ -1016,6 +1869,14 @@ def apply_freeze_train_strategy_precise(model):
         if idx < len(aggregator.global_blocks):
             for param in aggregator.global_blocks[idx].parameters():
                 param.requires_grad = False
+    # 解冻后4层
+    for idx in stage1_partial:
+        if idx < len(aggregator.frame_blocks):
+            for param in aggregator.frame_blocks[idx].parameters():
+                param.requires_grad = True
+        if idx < len(aggregator.global_blocks):
+            for param in aggregator.global_blocks[idx].parameters():
+                param.requires_grad = True
     
     # Stage-3: frame_blocks[18:24], global_blocks[18:24]
     stage3_indices = list(range(18, 24))
@@ -1028,11 +1889,15 @@ def apply_freeze_train_strategy_precise(model):
                 param.requires_grad = False
     print(f"  ✓ Frozen: Stage-1 ({len(stage1_indices)} layers) & Stage-3 ({len(stage3_indices)} layers) Transformer blocks")
     
-    # 1.3 深度头/点图头 (DPT-head): 先冻结（可在后期解冻做轻微收尾）
+    # 1.3 深度头/点图头 (DPT-head): 解冻输出层用于多视角一致性学习
     if hasattr(model, 'depth_head') and model.depth_head is not None:
-        for param in model.depth_head.parameters():
-            param.requires_grad = False
-        print("  ✓ Frozen: depth_head (DPT-head, can be unfrozen later for fine-tuning)")
+        # 冻结大部分层，只解冻输出层
+        for name, param in model.depth_head.named_parameters():
+            if 'scratch.output_conv' in name or 'output' in name or 'refinenet' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        print("  ✓ Partially Unfrozen: depth_head (output layers trainable for multi-view consistency)")
     
     if hasattr(model, 'point_head') and model.point_head is not None:
         for param in model.point_head.parameters():
@@ -1075,6 +1940,44 @@ def apply_freeze_train_strategy_precise(model):
                     param.requires_grad = True
             print("  ✓ Training: camera_head.view_proj (view-specific shim layers)")
     
+    # 1.5 高斯参数头 (GS Head): 部分解冻（最后1-2层）用于学习融合
+    if hasattr(model, 'gaussian_param_head') and model.gaussian_param_head is not None:
+        # 冻结大部分层，只解冻最后层
+        for name, param in model.gaussian_param_head.named_parameters():
+            if 'output' in name or 'final' in name or 'scratch.output_conv' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        print("  ✓ Partially Unfrozen: gaussian_param_head (last layers trainable for fusion)")
+    
+    # 1.5b Voxel Gaussian Head (Teacher): 保持冻结或部分解冻
+    if hasattr(model, 'voxel_gaussian_head') and model.voxel_gaussian_head is not None:
+        # 保持Teacher冻结，只用于蒸馏
+        for param in model.voxel_gaussian_head.parameters():
+            param.requires_grad = False
+        print("  ✓ Frozen: voxel_gaussian_head (Teacher, for distillation)")
+    
+    # 1.5c Fused Gaussian Head (Student): 全训
+    if hasattr(model, 'fused_gaussian_head') and model.fused_gaussian_head is not None:
+        for param in model.fused_gaussian_head.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: fused_gaussian_head (Student, learns unified representation)")
+    
+    # 1.5d Fusion Head: 全训
+    if hasattr(model, 'fusion_head') and model.fusion_head is not None:
+        for param in model.fusion_head.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: fusion_head (multi-view fusion)")
+    
+    # 1.5e Gaussian Renderer: 全训（如果使用）
+    if hasattr(model, 'gaussian_renderer') and model.gaussian_renderer is not None:
+        for param in model.gaussian_renderer.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: gaussian_renderer (differentiable rendering)")
+    
+    # 1.6 体素化模块的MLP: 冻结（如果是预训练的），但通常需要训练
+    # 这里先标记为可训练，后续可根据需要调整
+    
     # ========== 训练部分 ==========
     print("\n[Training Parameters]")
     
@@ -1083,6 +1986,38 @@ def apply_freeze_train_strategy_precise(model):
         for param in aggregator.viewmixer.parameters():
             param.requires_grad = True
         print("  ✓ Training: ViewMixer (Stage-0, cross-view attention with LoRA)")
+    
+    # 2.1a 体素化模块的MLP - 训练（用于体素特征投影和位置编码）
+    if hasattr(model, 'voxelization') and model.voxelization is not None:
+        voxel_module = model.voxelization
+        # 训练体素特征投影MLP
+        if hasattr(voxel_module, 'voxel_feat_proj'):
+            for param in voxel_module.voxel_feat_proj.parameters():
+                param.requires_grad = True
+        # 训练位置编码MLP
+        if hasattr(voxel_module, 'pos_encoding'):
+            for param in voxel_module.pos_encoding.parameters():
+                param.requires_grad = True
+        # 训练token融合层
+        if hasattr(voxel_module, 'token_fusion'):
+            for param in voxel_module.token_fusion.parameters():
+                param.requires_grad = True
+        print("  ✓ Training: VoxelizationModule MLPs (voxel_feat_proj, pos_encoding, token_fusion)")
+    
+    # 2.1b 体素级Gaussian Head - 训练（新模块，需要从头训练）
+    if hasattr(model, 'voxel_gaussian_head') and model.voxel_gaussian_head is not None:
+        for param in model.voxel_gaussian_head.parameters():
+            param.requires_grad = True
+        print("  ✓ Training: voxel_gaussian_head (Voxel-level Gaussian Splatting head)")
+    
+    # 2.1c 掩码抬升模块 - 训练（α和τ参数）
+    if hasattr(aggregator, 'mask_lifting') and aggregator.mask_lifting is not None:
+        mask_lift = aggregator.mask_lifting
+        if hasattr(mask_lift, 'alpha_logit'):
+            mask_lift.alpha_logit.requires_grad = True
+        if hasattr(mask_lift, 'tau_logit'):
+            mask_lift.tau_logit.requires_grad = True
+        print("  ✓ Training: mask_lifting (alpha, tau parameters for mask lifting)")
     
     # 2.2 Stage-2 (10层: 8-17) - 全训（掩码化 Global + 时序 Frame 的主干）
     stage2_indices = list(range(8, 18))
@@ -1216,6 +2151,12 @@ class LossConfig:
         self.use_kpt = False               # L_kpt^D: 关键点重投影
         self.use_temp_d = False            # L_temp^D: 关键点时间平滑
         
+        # ========== 新增融合和渲染损失 ==========
+        self.use_fusion_reproj = True     # 融合重投影损失
+        self.use_gaussian_distill = True   # 高斯蒸馏
+        self.use_temporal_gaussian = True  # 时序高斯一致性
+        self.use_depth_consistency = True  # 深度一致性损失
+        
         # 权重配置（按照图片中的初始权重）
         self.weights = {
             'mask_ce': 1.0,
@@ -1231,6 +2172,11 @@ class LossConfig:
             'photo': 0.2,
             'kpt': 2.0,
             'temp_d': 0.5,
+            # 新增损失权重
+            'fusion_reproj': 1.0,
+            'gaussian_distill': 0.5,
+            'temporal_gaussian': 0.5,
+            'depth_consistency': 0.3,
         }
     
     def load_full_config(self):
@@ -1996,6 +2942,709 @@ def compute_dual_stream_separation_loss(predictions, loss_config=None):
     return L_sep, {'L_sep': L_sep.item()}
 
 
+def compute_multiview_geometric_loss(
+    voxel_xyz: torch.Tensor,  # [B, T, N_voxels, 3] 体素中心坐标
+    intrinsics: torch.Tensor,  # [B, T, V, 3, 3]
+    extrinsics: torch.Tensor,  # [B, T, V, 3, 4]
+    static_mask: Optional[torch.Tensor] = None,  # [B, T, N_voxels] 静态区掩码
+    loss_type: str = 'charbonnier',  # 'l1', 'l2', 'charbonnier'
+    alpha: float = 0.25,  # Charbonnier参数
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    跨视角几何重投影损失（体素域）
+    
+    将体素中心重投影到其他视角，计算重投影误差。
+    
+    Args:
+        voxel_xyz: 体素中心坐标 [B, T, N_voxels, 3]
+        intrinsics: 相机内参 [B, T, V, 3, 3]
+        extrinsics: 相机外参 [B, T, V, 3, 4]
+        static_mask: 静态区掩码 [B, T, N_voxels]
+        loss_type: 损失类型
+        alpha: Charbonnier损失参数
+    Returns:
+        loss: 总损失
+        loss_dict: 损失字典
+    """
+    B, T, N_voxels, _ = voxel_xyz.shape
+    _, _, V, _, _ = intrinsics.shape
+    device = voxel_xyz.device
+    
+    if V < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True), {'L_mv_geo': 0.0}
+    
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_pairs = 0
+    
+    for t in range(T):
+        for v_ref in range(V):
+            # 参考视角的体素
+            voxels_ref = voxel_xyz[:, t, :, :]  # [B, N_voxels, 3]
+            
+            # 应用静态掩码
+            if static_mask is not None:
+                mask_t = static_mask[:, t, :].unsqueeze(-1)  # [B, N_voxels, 1]
+                valid_voxels = mask_t.squeeze(-1) > 0.5
+                if valid_voxels.sum() == 0:
+                    continue
+            else:
+                valid_voxels = torch.ones(B, N_voxels, dtype=torch.bool, device=device)
+            
+            for v_target in range(V):
+                if v_target == v_ref:
+                    continue
+                
+                # 获取相机参数
+                K_ref = intrinsics[:, t, v_ref, :, :]  # [B, 3, 3]
+                E_ref = extrinsics[:, t, v_ref, :, :]  # [B, 3, 4]
+                K_target = intrinsics[:, t, v_target, :, :]  # [B, 3, 3]
+                E_target = extrinsics[:, t, v_target, :, :]  # [B, 3, 4]
+                
+                # 将体素从世界坐标投影到参考视角和目标视角
+                # 完整流程：世界坐标 -> 参考相机坐标系 -> 参考像素坐标 -> 
+                #          -> 目标相机坐标系 -> 目标像素坐标
+                
+                # 对每个batch分别处理
+                for b in range(B):
+                    if not valid_voxels[b].any():
+                        continue
+                    
+                    voxels_b = voxels_ref[b][valid_voxels[b]]  # [N_valid, 3] 世界坐标
+                    if voxels_b.shape[0] == 0:
+                        continue
+                    
+                    # 获取该batch的相机参数
+                    K_ref_b = K_ref[b]  # [3, 3]
+                    E_ref_b = E_ref[b]  # [3, 4]
+                    K_target_b = K_target[b]  # [3, 3]
+                    E_target_b = E_target[b]  # [3, 4]
+                    
+                    # 提取旋转和平移
+                    R_ref = E_ref_b[:, :3]  # [3, 3]
+                    t_ref = E_ref_b[:, 3:4]  # [3, 1]
+                    R_target = E_target_b[:, :3]  # [3, 3]
+                    t_target = E_target_b[:, 3:4]  # [3, 1]
+                    
+                    # Step 1: 世界坐标 -> 参考相机坐标系
+                    voxels_ref_cam = (R_ref @ voxels_b.T + t_ref).T  # [N_valid, 3]
+                    # 深度过滤（只保留深度>0的点）
+                    depth_mask = voxels_ref_cam[:, 2] > 0.01
+                    if depth_mask.sum() == 0:
+                        continue
+                    voxels_ref_cam_valid = voxels_ref_cam[depth_mask]  # [N_valid2, 3]
+                    
+                    # Step 2: 参考相机坐标系 -> 参考像素坐标
+                    voxels_ref_cam_homo = torch.cat([
+                        voxels_ref_cam_valid,
+                        torch.ones(voxels_ref_cam_valid.shape[0], 1, device=device)
+                    ], dim=1)  # [N_valid2, 4] 齐次坐标
+                    pixels_ref = (K_ref_b @ voxels_ref_cam_valid.T).T  # [N_valid2, 3]
+                    pixels_ref = pixels_ref[:, :2] / (pixels_ref[:, 2:3] + 1e-8)  # [N_valid2, 2] 归一化
+                    
+                    # Step 3: 参考像素坐标 -> 世界坐标（反投影）
+                    # 使用参考视角的深度信息，反投影回3D
+                    depth_ref = voxels_ref_cam_valid[:, 2:3]  # [N_valid2, 1]
+                    pixels_ref_homo = torch.cat([
+                        pixels_ref, 
+                        torch.ones(pixels_ref.shape[0], 1, device=device)
+                    ], dim=1)  # [N_valid2, 3]
+                    points_ref_cam = (torch.inverse(K_ref_b) @ pixels_ref_homo.T).T  # [N_valid2, 3] 归一化相机坐标
+                    points_ref_cam = points_ref_cam * depth_ref  # [N_valid2, 3] 相机坐标
+                    points_world = (R_ref.T @ (points_ref_cam.T - t_ref)).T  # [N_valid2, 3] 世界坐标
+                    
+                    # Step 4: 世界坐标 -> 目标相机坐标系
+                    points_target_cam = (R_target @ points_world.T + t_target).T  # [N_valid2, 3]
+                    depth_mask2 = points_target_cam[:, 2] > 0.01
+                    if depth_mask2.sum() == 0:
+                        continue
+                    points_target_cam_valid = points_target_cam[depth_mask2]  # [N_valid3, 3]
+                    
+                    # Step 5: 目标相机坐标系 -> 目标像素坐标
+                    pixels_target = (K_target_b @ points_target_cam_valid.T).T  # [N_valid3, 3]
+                    pixels_target = pixels_target[:, :2] / (pixels_target[:, 2:3] + 1e-8)  # [N_valid3, 2]
+                    
+                    # Step 6: 直接计算重投影误差
+                    # 将原始体素直接投影到目标视角，与重投影结果比较
+                    voxels_target_cam = (R_target @ voxels_b[depth_mask][depth_mask2].T + t_target).T  # [N_valid3, 3]
+                    pixels_target_direct = (K_target_b @ voxels_target_cam.T).T  # [N_valid3, 3]
+                    pixels_target_direct = pixels_target_direct[:, :2] / (pixels_target_direct[:, 2:3] + 1e-8)  # [N_valid3, 2]
+                    
+                    # 计算重投影误差
+                    reprojection_error = pixels_target - pixels_target_direct  # [N_valid3, 2]
+                    
+                    # 应用损失函数
+                    if loss_type == 'l1':
+                        loss_batch = torch.abs(reprojection_error).mean()
+                    elif loss_type == 'l2':
+                        loss_batch = (reprojection_error ** 2).mean()
+                    elif loss_type == 'charbonnier':
+                        loss_batch = torch.sqrt(reprojection_error ** 2 + alpha ** 2).mean() - alpha
+                    else:
+                        loss_batch = (reprojection_error ** 2).mean()
+                    
+                    total_loss = total_loss + loss_batch
+                    num_pairs += 1
+    
+    if num_pairs > 0:
+        # 平均损失
+        total_loss = total_loss / num_pairs
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return total_loss, {'L_mv_geo': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss}
+
+
+def compute_epipolar_constraint_loss(
+    points2d_view1: torch.Tensor,  # [B, T, N_points, 2] 视角1的2D点
+    points2d_view2: torch.Tensor,  # [B, T, N_points, 2] 视角2的2D点
+    intrinsics_view1: torch.Tensor,  # [B, T, 3, 3]
+    intrinsics_view2: torch.Tensor,  # [B, T, 3, 3]
+    extrinsics_view1: torch.Tensor,  # [B, T, 3, 4]
+    extrinsics_view2: torch.Tensor,  # [B, T, 3, 4]
+    static_mask: Optional[torch.Tensor] = None,  # [B, T, N_points]
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    对极约束损失 |x'T E x|
+    
+    Args:
+        points2d_view1: 视角1的2D点 [B, T, N_points, 2]
+        points2d_view2: 视角2的2D点 [B, T, N_points, 2]
+        intrinsics_view1: 视角1内参 [B, T, 3, 3]
+        intrinsics_view2: 视角2内参 [B, T, 3, 3]
+        extrinsics_view1: 视角1外参 [B, T, 3, 4]
+        extrinsics_view2: 视角2外参 [B, T, 3, 4]
+        static_mask: 静态区掩码 [B, T, N_points]
+    Returns:
+        loss: 对极约束损失
+        loss_dict: 损失字典
+    """
+    device = points2d_view1.device
+    B, T, N_points, _ = points2d_view1.shape
+    
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_valid = 0
+    
+    for t in range(T):
+        for b in range(B):
+            # 获取该batch和时刻的点
+            p1 = points2d_view1[b, t]  # [N_points, 2]
+            p2 = points2d_view2[b, t]  # [N_points, 2]
+            
+            # 应用静态掩码
+            if static_mask is not None:
+                mask = static_mask[b, t] > 0.5  # [N_points]
+                if mask.sum() == 0:
+                    continue
+                p1 = p1[mask]
+                p2 = p2[mask]
+            
+            if p1.shape[0] == 0:
+                continue
+            
+            # 计算基础矩阵E（从外参）
+            E1 = extrinsics_view1[b, t]  # [3, 4]
+            E2 = extrinsics_view2[b, t]  # [3, 4]
+            K1 = intrinsics_view1[b, t]  # [3, 3]
+            K2 = intrinsics_view2[b, t]  # [3, 3]
+            
+            # 提取旋转和平移
+            R1 = E1[:, :3]  # [3, 3]
+            t1 = E1[:, 3:4]  # [3, 1]
+            R2 = E2[:, :3]  # [3, 3]
+            t2 = E2[:, 3:4]  # [3, 1]
+            
+            # 计算相对变换：从视角1到视角2
+            R_rel = R2 @ R1.T  # [3, 3]
+            t_rel = t2 - R_rel @ t1  # [3, 1]
+            
+            # 计算反对称矩阵 [t]_×
+            t_rel_skew = torch.zeros(3, 3, device=device)
+            t_rel_skew[0, 1] = -t_rel[2, 0]
+            t_rel_skew[0, 2] = t_rel[1, 0]
+            t_rel_skew[1, 0] = t_rel[2, 0]
+            t_rel_skew[1, 2] = -t_rel[0, 0]
+            t_rel_skew[2, 0] = -t_rel[1, 0]
+            t_rel_skew[2, 1] = t_rel[0, 0]
+            
+            # 计算本质矩阵 E = [t]_× * R
+            E_cam = t_rel_skew @ R_rel  # [3, 3] 本质矩阵（相机坐标系）
+            
+            # 转换到像素坐标系：F = K2^{-T} * E * K1^{-1}
+            K1_inv = torch.inverse(K1)
+            K2_inv_T = torch.inverse(K2).T
+            F = K2_inv_T @ E_cam @ K1_inv  # [3, 3] 基础矩阵（像素坐标系）
+            
+            # 对极约束：x2^T * F * x1 = 0
+            # 将2D点转换为齐次坐标
+            p1_homo = torch.cat([p1, torch.ones(p1.shape[0], 1, device=device)], dim=1)  # [N_points, 3]
+            p2_homo = torch.cat([p2, torch.ones(p2.shape[0], 1, device=device)], dim=1)  # [N_points, 3]
+            
+            # 计算对极约束误差
+            # F * x1: [N_points, 3]
+            Fx1 = (F @ p1_homo.T).T  # [N_points, 3]
+            # x2^T * (F * x1): [N_points]
+            epipolar_error = torch.abs((p2_homo * Fx1).sum(dim=1))  # [N_points]
+            
+            # 应用损失函数（Charbonnier loss）
+            epipolar_loss = torch.sqrt(epipolar_error ** 2 + 0.1 ** 2) - 0.1  # [N_points]
+            total_loss = total_loss + epipolar_loss.sum()
+            num_valid += p1.shape[0]
+    
+    if num_valid > 0:
+        total_loss = total_loss / num_valid
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return total_loss, {'L_epi': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss}
+
+
+def match_voxel_ids(
+    ids_t: torch.Tensor,  # [N_t] 时间步t的体素ID
+    ids_t_delta: torch.Tensor,  # [N_t+delta] 时间步t+delta的体素ID
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    精确匹配同ID的体素对（优化版本）
+    
+    使用高效的tensor操作进行ID匹配，避免Python循环。
+    
+    Args:
+        ids_t: 时间步t的体素ID [N_t]
+        ids_t_delta: 时间步t+delta的体素ID [N_t+delta]
+    Returns:
+        matched_indices_t: 时间步t的匹配索引 [M] (M是匹配对数)
+        matched_indices_t_delta: 时间步t+delta的匹配索引 [M]
+    """
+    device = ids_t.device
+    
+    if ids_t.numel() == 0 or ids_t_delta.numel() == 0:
+        return torch.tensor([], dtype=torch.long, device=device), torch.tensor([], dtype=torch.long, device=device)
+    
+    # 方法：使用torch.searchsorted（需要排序，但更高效）
+    # 首先对ids_t_delta排序，然后对ids_t中的每个ID在排序后的数组中查找
+    
+    # 对ids_t_delta排序并获取排序索引
+    ids_t_delta_sorted, sort_indices_delta = torch.sort(ids_t_delta)
+    
+    # 对ids_t排序（用于去重和查找）
+    ids_t_sorted, sort_indices_t = torch.sort(ids_t)
+    
+    # 使用searchsorted查找匹配
+    # 对于每个ids_t中的ID，在ids_t_delta_sorted中查找
+    # 注意：searchsorted返回插入位置，需要检查是否精确匹配
+    search_indices = torch.searchsorted(ids_t_delta_sorted, ids_t_sorted, side='left')
+    
+    # 检查是否超出范围
+    valid_mask = search_indices < ids_t_delta_sorted.shape[0]
+    
+    # 检查是否精确匹配（不是插入位置）
+    match_mask = valid_mask & (ids_t_delta_sorted[search_indices] == ids_t_sorted)
+    
+    if not match_mask.any():
+        return torch.tensor([], dtype=torch.long, device=device), torch.tensor([], dtype=torch.long, device=device)
+    
+    # 获取匹配的索引
+    matched_sorted_indices_t = torch.where(match_mask)[0]  # 在ids_t_sorted中的索引
+    matched_sorted_indices_delta = search_indices[match_mask]  # 在ids_t_delta_sorted中的索引
+    
+    # 还原到原始索引
+    matched_indices_t = sort_indices_t[matched_sorted_indices_t]  # [M]
+    matched_indices_delta_sorted = sort_indices_delta[matched_sorted_indices_delta]  # [M]
+    
+    # 如果ids_t_delta中有重复ID，matched_indices_delta_sorted可能有重复
+    # 简化：对于重复的情况，取第一个出现的索引
+    # 更精确的做法：为每个匹配的ID找到对应的第一个索引
+    matched_ids = ids_t[matched_indices_t]  # [M] 匹配的ID
+    matched_indices_t_delta = []
+    for i, vid in enumerate(matched_ids):
+        # 在ids_t_delta中查找第一个等于vid的索引
+        matches_delta = torch.where(ids_t_delta == vid)[0]
+        if matches_delta.numel() > 0:
+            matched_indices_t_delta.append(matches_delta[0])
+        else:
+            # 不应该发生，跳过
+            continue
+    
+    if len(matched_indices_t_delta) == 0:
+        return torch.tensor([], dtype=torch.long, device=device), torch.tensor([], dtype=torch.long, device=device)
+    
+    # 只保留有对应匹配的indices_t
+    matched_indices_t_delta_tensor = torch.stack(matched_indices_t_delta).to(device)
+    matched_indices_t = matched_indices_t[:len(matched_indices_t_delta_tensor)]
+    
+    return matched_indices_t, matched_indices_t_delta_tensor
+
+
+def compute_temporal_smoothness_loss_voxel(
+    voxel_xyz: List[torch.Tensor],  # T个list，每个list包含B个[N_t, 3]
+    voxel_ids: List[torch.Tensor],  # T个list，每个list包含B个[N_t]
+    delta: int = 1,  # 时间差分步长
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    体素轨迹时间平滑损失（同ID精确匹配）
+    
+    使用精确的体素ID匹配，而不是最近邻近似。
+    
+    Args:
+        voxel_xyz: 每个时间步的体素坐标列表 [T个list，每个list包含B个[N_t, 3]]
+        voxel_ids: 每个时间步的体素ID列表 [T个list，每个list包含B个[N_t]]
+        delta: 时间差分步长
+    Returns:
+        loss: 时间平滑损失
+        loss_dict: 损失字典
+    """
+    if len(voxel_xyz) < delta + 1 or len(voxel_ids) < delta + 1:
+        device = voxel_xyz[0][0].device if voxel_xyz and len(voxel_xyz) > 0 and len(voxel_xyz[0]) > 0 else torch.device('cpu')
+        return torch.tensor(0.0, device=device, requires_grad=True), {'L_temp': 0.0}
+    
+    device = voxel_xyz[0][0].device if voxel_xyz and len(voxel_xyz) > 0 and len(voxel_xyz[0]) > 0 else torch.device('cpu')
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_matches = 0
+    
+    # 对相邻时间步计算差分
+    for t in range(len(voxel_xyz) - delta):
+        if t >= len(voxel_xyz) or (t + delta) >= len(voxel_xyz):
+            continue
+        
+        xyz_list_t = voxel_xyz[t]  # list of [N_t, 3]
+        xyz_list_t_delta = voxel_xyz[t + delta]  # list of [N_t+delta, 3]
+        ids_list_t = voxel_ids[t]  # list of [N_t]
+        ids_list_t_delta = voxel_ids[t + delta]  # list of [N_t+delta]
+        
+        # 对每个batch分别处理
+        B = len(xyz_list_t)
+        for b in range(B):
+            if b >= len(xyz_list_t) or b >= len(xyz_list_t_delta):
+                continue
+            
+            xyz_b_t = xyz_list_t[b]  # [N_t, 3]
+            xyz_b_t_delta = xyz_list_t_delta[b]  # [N_t+delta, 3]
+            ids_b_t = ids_list_t[b]  # [N_t]
+            ids_b_t_delta = ids_list_t_delta[b]  # [N_t+delta]
+            
+            if xyz_b_t.shape[0] == 0 or xyz_b_t_delta.shape[0] == 0:
+                continue
+            
+            # 精确匹配同ID的体素对
+            matched_idx_t, matched_idx_t_delta = match_voxel_ids(ids_b_t, ids_b_t_delta)
+            
+            if matched_idx_t.numel() > 0:
+                # 计算匹配体素对的位移
+                xyz_matched_t = xyz_b_t[matched_idx_t]  # [M, 3]
+                xyz_matched_t_delta = xyz_b_t_delta[matched_idx_t_delta]  # [M, 3]
+                
+                # 时间平滑：同ID体素的位移应该小
+                displacements = torch.norm(xyz_matched_t_delta - xyz_matched_t, p=2, dim=-1)  # [M]
+                total_loss = total_loss + displacements.mean()
+                num_matches += 1
+    
+    if num_matches > 0:
+        total_loss = total_loss / num_matches
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return total_loss, {'L_temp': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss}
+
+
+def compute_keypoint_reprojection_loss(
+    keypoints_2d: torch.Tensor,  # [B, T, V, N_kpts, 2] 2D关键点
+    voxel_xyz: torch.Tensor,  # [B, T, N_voxels, 3] 体素坐标（对应关键点的3D位置）
+    intrinsics: torch.Tensor,  # [B, T, V, 3, 3]
+    extrinsics: torch.Tensor,  # [B, T, V, 3, 4]
+    dynamic_mask: Optional[torch.Tensor] = None,  # [B, T, N_kpts] 动态区掩码
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    2D关键点重投影/三角化损失
+    
+    Args:
+        keypoints_2d: 2D关键点 [B, T, V, N_kpts, 2]
+        voxel_xyz: 体素坐标（关键点的3D位置） [B, T, N_voxels, 3]
+        intrinsics: 相机内参 [B, T, V, 3, 3]
+        extrinsics: 相机外参 [B, T, V, 3, 4]
+        dynamic_mask: 动态区掩码 [B, T, N_kpts]
+    Returns:
+        loss: 重投影损失
+        loss_dict: 损失字典
+    """
+    device = keypoints_2d.device
+    B, T, V, N_kpts, _ = keypoints_2d.shape
+    
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    num_valid = 0
+    
+    for t in range(T):
+        for b in range(B):
+            for v in range(V):
+                kpts_2d = keypoints_2d[b, t, v]  # [N_kpts, 2]
+                xyz_3d = voxel_xyz[b, t]  # [N_voxels, 3]
+                
+                # 应用动态掩码
+                if dynamic_mask is not None:
+                    mask = dynamic_mask[b, t] > 0.5  # [N_kpts]
+                    if mask.sum() == 0:
+                        continue
+                    kpts_2d = kpts_2d[mask]
+                else:
+                    mask = torch.ones(N_kpts, dtype=torch.bool, device=device)
+                
+                if kpts_2d.shape[0] == 0:
+                    continue
+                
+                # 获取相机参数
+                K = intrinsics[b, t, v]  # [3, 3]
+                E = extrinsics[b, t, v]  # [3, 4]
+                
+                # 将3D点投影到2D
+                # TODO: 实现完整的投影
+                # 简化：占位符
+                num_valid += kpts_2d.shape[0]
+    
+    if num_valid > 0:
+        total_loss = total_loss / num_valid
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return total_loss, {'L_kpt': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss}
+
+
+def compute_fusion_reprojection_loss(
+    rendered_images: torch.Tensor,  # [B, T, V, 3, H, W]
+    target_images: torch.Tensor,  # [B, T, V, 3, H, W]
+    visibility: Optional[torch.Tensor] = None,  # [B, T, V, N] 高斯可见性
+    loss_config=None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    融合重投影损失：将融合后的高斯渲染回各视角，与真实图像比较
+    
+    Args:
+        rendered_images: 渲染图像 [B, T, V, 3, H, W]
+        target_images: 目标图像 [B, T, V, 3, H, W]
+        visibility: 高斯可见性 [B, T, V, N]
+        loss_config: 损失配置
+    Returns:
+        loss: 重投影损失
+        loss_dict: 损失字典
+    """
+    device = rendered_images.device
+    B, T, V, C, H, W = rendered_images.shape
+    
+    # L1损失
+    l1_loss = F.l1_loss(rendered_images, target_images, reduction='none')  # [B, T, V, 3, H, W]
+    
+    # 如果提供可见性，只在可见区域计算
+    if visibility is not None:
+        # 将可见性映射到图像空间（简化：假设可见性影响整个图像）
+        # TODO: 实现精确的可见性映射
+        pass
+    
+    l1_loss = l1_loss.mean()
+    
+    # SSIM损失（简化版）
+    # TODO: 实现完整SSIM
+    ssim_loss = torch.tensor(0.0, device=device)
+    
+    # LPIPS损失（需要LPIPS模型）
+    # TODO: 实现LPIPS
+    
+    total_loss = l1_loss + 0.1 * ssim_loss
+    
+    return total_loss, {
+        'L_fusion_reproj': total_loss.item(),
+        'L_fusion_l1': l1_loss.item(),
+        'L_fusion_ssim': ssim_loss.item(),
+    }
+
+
+def compute_depth_consistency_loss(
+    rendered_depth: torch.Tensor,  # [B, T, V, H, W]
+    predicted_depth: torch.Tensor,  # [B, T, V, H, W]
+    mask: Optional[torch.Tensor] = None,  # [B, T, V, H, W] 掩码
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    深度一致性损失：投影深度与per-view深度一致
+    
+    Args:
+        rendered_depth: 渲染深度 [B, T, V, H, W]
+        predicted_depth: 预测深度 [B, T, V, H, W]
+        mask: 掩码 [B, T, V, H, W]
+    Returns:
+        loss: 深度一致性损失
+        loss_dict: 损失字典
+    """
+    device = rendered_depth.device
+    
+    # L1损失
+    depth_diff = torch.abs(rendered_depth - predicted_depth)  # [B, T, V, H, W]
+    
+    if mask is not None:
+        depth_diff = depth_diff * mask
+        loss = depth_diff.sum() / (mask.sum() + 1e-8)
+    else:
+        loss = depth_diff.mean()
+    
+    return loss, {'L_depth_consistency': loss.item()}
+
+
+def compute_gaussian_distillation_loss(
+    teacher_gaussians: torch.Tensor,  # [B, T, V, N, 83] Teacher高斯参数
+    student_gaussians: torch.Tensor,  # [B, T, N, 83] Student融合高斯参数
+    loss_config=None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    高斯蒸馏损失：Teacher (per-view) → Student (fused)
+    
+    Args:
+        teacher_gaussians: Teacher高斯参数 [B, T, V, N, 83]
+        student_gaussians: Student融合高斯参数 [B, T, N, 83]
+        loss_config: 损失配置
+    Returns:
+        loss: 蒸馏损失
+        loss_dict: 损失字典
+    """
+    device = teacher_gaussians.device
+    B, T, V, N, _ = teacher_gaussians.shape
+    
+    # 将Teacher高斯融合（简单平均）
+    teacher_fused = teacher_gaussians.mean(dim=2)  # [B, T, N, 83]
+    
+    # L2损失
+    l2_loss = F.mse_loss(student_gaussians, teacher_fused, reduction='mean')
+    
+    # 分离不同参数类型
+    # Opacity
+    opacity_loss = F.mse_loss(
+        student_gaussians[..., 0:1], 
+        teacher_fused[..., 0:1]
+    )
+    
+    # Scales
+    scales_loss = F.mse_loss(
+        student_gaussians[..., 1:4], 
+        teacher_fused[..., 1:4]
+    )
+    
+    # Rotations (使用四元数距离)
+    rot_student = student_gaussians[..., 4:8]
+    rot_teacher = teacher_fused[..., 4:8]
+    rot_loss = F.mse_loss(rot_student, rot_teacher)
+    
+    # SH coefficients
+    sh_loss = F.mse_loss(
+        student_gaussians[..., 8:], 
+        teacher_fused[..., 8:]
+    )
+    
+    total_loss = l2_loss + 0.5 * (opacity_loss + scales_loss + rot_loss + sh_loss)
+    
+    return total_loss, {
+        'L_gaussian_distill': total_loss.item(),
+        'L_distill_l2': l2_loss.item(),
+        'L_distill_opacity': opacity_loss.item(),
+        'L_distill_scales': scales_loss.item(),
+        'L_distill_rot': rot_loss.item(),
+        'L_distill_sh': sh_loss.item(),
+    }
+
+
+def compute_gaussian_regularization_loss(
+    gaussian_params: torch.Tensor,  # [B, T, N, 83]
+    loss_config=None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    高斯正则化损失：协方差正则、密度管理
+    
+    Args:
+        gaussian_params: 高斯参数 [B, T, N, 83]
+        loss_config: 损失配置
+    Returns:
+        loss: 正则化损失
+        loss_dict: 损失字典
+    """
+    device = gaussian_params.device
+    
+    # 提取参数
+    opacity = gaussian_params[..., 0:1]  # [B, T, N, 1]
+    scales = gaussian_params[..., 1:4]  # [B, T, N, 3]
+    
+    # 协方差正则：防止scales过大或过小
+    scales_min = scales.min()
+    scales_max = scales.max()
+    scales_std = scales.std()
+    
+    # 鼓励scales在合理范围
+    scales_reg = torch.clamp(scales, min=1e-6, max=1.0).mean()
+    
+    # Opacity正则：鼓励合理的opacity分布
+    opacity_reg = opacity.mean()
+    
+    total_loss = 0.1 * (scales_std + opacity_reg)
+    
+    return total_loss, {
+        'L_gaussian_reg': total_loss.item(),
+        'L_reg_scales': scales_std.item(),
+        'L_reg_opacity': opacity_reg.item(),
+    }
+
+
+def compute_temporal_gaussian_consistency(
+    gaussian_params: torch.Tensor,  # [B, T, N, 83]
+    gaussian_xyz: torch.Tensor,  # [B, T, N, 3]
+    temporal_tracker=None,  # TemporalTracker实例
+    loss_config=None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    时序高斯一致性损失：高斯轨迹平滑
+    
+    Args:
+        gaussian_params: 高斯参数 [B, T, N, 83]
+        gaussian_xyz: 高斯位置 [B, T, N, 3]
+        temporal_tracker: 时序跟踪器
+        loss_config: 损失配置
+    Returns:
+        loss: 时序一致性损失
+        loss_dict: 损失字典
+    """
+    device = gaussian_params.device
+    B, T, N, _ = gaussian_params.shape
+    
+    if T < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True), {'L_temp_gaussian': 0.0}
+    
+    # 速度正则：‖μ_{t+1} - μ_t‖
+    velocity_loss = torch.tensor(0.0, device=device)
+    for t in range(T - 1):
+        vel = gaussian_xyz[:, t+1, :, :] - gaussian_xyz[:, t, :, :]  # [B, N, 3]
+        velocity_loss = velocity_loss + vel.norm(dim=-1).mean()
+    
+    velocity_loss = velocity_loss / (T - 1)
+    
+    # 加速度正则：‖(μ_{t+1}-μ_t) - (μ_t-μ_{t-1})‖
+    acceleration_loss = torch.tensor(0.0, device=device)
+    if T >= 3:
+        for t in range(1, T - 1):
+            vel_t = gaussian_xyz[:, t, :, :] - gaussian_xyz[:, t-1, :, :]  # [B, N, 3]
+            vel_t1 = gaussian_xyz[:, t+1, :, :] - gaussian_xyz[:, t, :, :]  # [B, N, 3]
+            acc = vel_t1 - vel_t  # [B, N, 3]
+            acceleration_loss = acceleration_loss + acc.norm(dim=-1).mean()
+        acceleration_loss = acceleration_loss / (T - 2)
+    
+    # Opacity平滑
+    opacity = gaussian_params[..., 0:1]  # [B, T, N, 1]
+    opacity_smooth = torch.tensor(0.0, device=device)
+    for t in range(T - 1):
+        opacity_diff = torch.abs(opacity[:, t+1, :, :] - opacity[:, t, :, :])
+        opacity_smooth = opacity_smooth + opacity_diff.mean()
+    opacity_smooth = opacity_smooth / (T - 1)
+    
+    total_loss = velocity_loss + 0.5 * acceleration_loss + 0.1 * opacity_smooth
+    
+    return total_loss, {
+        'L_temp_gaussian': total_loss.item(),
+        'L_temp_velocity': velocity_loss.item(),
+        'L_temp_acceleration': acceleration_loss.item() if T >= 3 else 0.0,
+        'L_temp_opacity': opacity_smooth.item(),
+    }
+
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[
@@ -2006,15 +3655,27 @@ if __name__ == "__main__":
     seganymo_dir = "data/SegAnyMo"
     train_mode = True  # 设置为True使用DataLoader训练，False使用推理模式
     
+    # 从环境变量读取dataset_length，默认100
+    dataset_length = int(os.environ.get('DATASET_LENGTH', '100'))
+    print(f"Dataset length: {dataset_length}")
+    
     if train_mode and os.path.exists(images_dir):
         print(f"\n{'='*60}")
         print("Training Mode: Using DataLoader with Augmentation + SegAnyMo Supervision")
         print(f"{'='*60}")
         
         # 创建训练Dataset（启用数据增强和SegAnyMo监督）
+        # 数据目录路径
+        depths_dir = os.path.join(os.path.dirname(images_dir), "depths") if images_dir else None
+        intrinsics_dir = os.path.join(os.path.dirname(images_dir), "intrs") if images_dir else None
+        extrinsics_dir = os.path.join(os.path.dirname(images_dir), "extrs") if images_dir else None
+        
         train_dataset = MultiViewTemporalDataset(
             images_dir=images_dir,
             seganymo_dir=seganymo_dir if os.path.exists(seganymo_dir) else None,
+            depths_dir=depths_dir if depths_dir and os.path.exists(depths_dir) else None,
+            intrinsics_dir=intrinsics_dir if intrinsics_dir and os.path.exists(intrinsics_dir) else None,
+            extrinsics_dir=extrinsics_dir if extrinsics_dir and os.path.exists(extrinsics_dir) else None,
             target_size=378,
             mode="crop",
             T_window_sizes=[2],  # 时序窗口大小列表（最大8，避免OOM）
@@ -2023,7 +3684,10 @@ if __name__ == "__main__":
             enable_intra_frame_aug=False,  # 帧内增强（可选，默认关闭）
             use_seganymo_mask=True,  # 启用SegAnyMo mask监督
             mask_source="sam2/mask_frames",  # 或 "sam2/initial_preds"
-            train=True
+            load_depth=True,  # 加载深度图
+            load_cameras=True,  # 加载相机参数（内外参）
+            train=True,
+            dataset_length=dataset_length
         )
         
         # 创建DataLoader
@@ -2044,13 +3708,18 @@ if __name__ == "__main__":
         # ========== 初始化模型 ==========
         origin = "checkpoint/checkpoint_150.pt"
         model_mv = VGGT_MV(
+            enable_gaussian=True,  # Enable GS Head
+            gaussian_output_dim=83,  # Default: 1(opacity) + 3(scales) + 4(rotations) + 3*25(SH_4) = 83
             img_size=374,
             patch_size=14,
             embed_dim=1024,
             enable_camera=True,
             enable_point=True,
             enable_depth=True,
-            enable_track=False  # 阶段1不训练track
+            enable_track=False,  # 阶段1不训练track
+            enable_voxelization=True,  # 启用体素化
+            enable_fusion=True,  # 启用融合
+            enable_rendering=True,  # 启用渲染
         )
         
         # 打印模型结构
@@ -2059,6 +3728,16 @@ if __name__ == "__main__":
         # 加载权重
         model_mv.to(device)
         load_stats = load_pretrained_weights(model_mv, origin, device=device, verbose=True) #mismatch (skipped): 1 keys： aggregator.patch_embed.pos_embed: checkpoint[1, 1370, 1024] vs model[1, 677, 1024]
+        
+        # Try loading GS Head weights from AnySplat model if available
+        anysplat_model_path = "/home/star/zzb/AnySplat/models/anysplat/model.safetensors"
+        if os.path.exists(anysplat_model_path):
+            print(f"\nAttempting to load GS Head weights from AnySplat model: {anysplat_model_path}")
+            load_stats_anysplat = load_pretrained_weights(model_mv, anysplat_model_path, device=device, verbose=True)
+            if load_stats_anysplat.get('gs_head_loaded', False):
+                print(f"  ✅ Successfully loaded GS Head weights from AnySplat model!")
+            else:
+                print(f"  ⚠️  GS Head weights not found in AnySplat model (check key names)")
         
         # ========== 阶段1：冻结参数（按照图片中的精确指令） ==========
         print("\n" + "="*60)
@@ -2158,6 +3837,12 @@ if __name__ == "__main__":
         
         model_mv.train()
         global_step = 0  # 全局步数计数器
+        sample_images_for_pointcloud = None  # 保存用于点云推理的样本
+        
+        # 创建点云保存目录
+        pointcloud_save_dir = os.path.join(log_dir_with_timestamp, "pointclouds")
+        os.makedirs(pointcloud_save_dir, exist_ok=True)
+        
         for epoch in range(num_epochs):
             epoch_losses = {
                 'total': 0.0,
@@ -2236,6 +3921,11 @@ if __name__ == "__main__":
                     masks_batch = None
                 B, T, V, C, H, W = images_batch.shape
                 
+                # 保存第一个epoch第一个batch的样本用于点云推理
+                if epoch == 0 and batch_idx == 0:
+                    sample_images_for_pointcloud = images_batch.clone().detach()
+                    print(f"  💾 Saved sample batch for pointcloud visualization: shape {sample_images_for_pointcloud.shape}")
+                
                 # 前向传播
                 optimizer.zero_grad()
                 
@@ -2267,8 +3957,72 @@ if __name__ == "__main__":
                         predictions, loss_config=loss_config
                     )
                     
+                    # 5. 新增融合和渲染损失
+                    fusion_reproj_loss = torch.tensor(0.0, device=images_batch.device)
+                    fusion_reproj_dict = {}
+                    if loss_config.use_fusion_reproj and 'rendered_images' in predictions:
+                        fusion_reproj_loss, fusion_reproj_dict = compute_fusion_reprojection_loss(
+                            rendered_images=predictions['rendered_images'],
+                            target_images=images_batch,
+                            visibility=predictions.get('gaussian_visibility'),
+                            loss_config=loss_config,
+                        )
+                        fusion_reproj_loss = fusion_reproj_loss * loss_config.weights['fusion_reproj']
+                    
+                    depth_consistency_loss = torch.tensor(0.0, device=images_batch.device)
+                    depth_consistency_dict = {}
+                    if loss_config.use_depth_consistency and 'rendered_depth' in predictions and 'depth' in predictions:
+                        depth_pred = predictions['depth']
+                        if len(depth_pred.shape) == 6:
+                            depth_pred = depth_pred.squeeze(-1)  # [B, T, V, H, W]
+                        depth_consistency_loss, depth_consistency_dict = compute_depth_consistency_loss(
+                            rendered_depth=predictions['rendered_depth'],
+                            predicted_depth=depth_pred,
+                            mask=predictions.get('mask_logits'),
+                        )
+                        depth_consistency_loss = depth_consistency_loss * loss_config.weights['depth_consistency']
+                    
+                    # 6. 高斯蒸馏损失
+                    gaussian_distill_loss = torch.tensor(0.0, device=images_batch.device)
+                    gaussian_distill_dict = {}
+                    if loss_config.use_gaussian_distill and 'teacher_gaussian_params' in predictions and 'fused_gaussian_params' in predictions:
+                        gaussian_distill_loss, gaussian_distill_dict = compute_gaussian_distillation_loss(
+                            teacher_gaussians=predictions['teacher_gaussian_params'],
+                            student_gaussians=predictions['fused_gaussian_params'],
+                            loss_config=loss_config,
+                        )
+                        gaussian_distill_loss = gaussian_distill_loss * loss_config.weights['gaussian_distill']
+                    
+                    # 7. 高斯正则化损失
+                    gaussian_reg_loss = torch.tensor(0.0, device=images_batch.device)
+                    gaussian_reg_dict = {}
+                    if 'fused_gaussian_params' in predictions:
+                        gaussian_reg_loss, gaussian_reg_dict = compute_gaussian_regularization_loss(
+                            gaussian_params=predictions['fused_gaussian_params'],
+                            loss_config=loss_config,
+                        )
+                        gaussian_reg_loss = gaussian_reg_loss * 0.1  # 较小的权重
+                    
+                    # 8. 时序高斯一致性损失
+                    temporal_gaussian_loss = torch.tensor(0.0, device=images_batch.device)
+                    temporal_gaussian_dict = {}
+                    if loss_config.use_temporal_gaussian and 'fused_gaussian_params' in predictions and 'fused_gaussian_xyz' in predictions:
+                        temporal_tracker = model_mv.temporal_tracker if hasattr(model_mv, 'temporal_tracker') else None
+                        temporal_gaussian_loss, temporal_gaussian_dict = compute_temporal_gaussian_consistency(
+                            gaussian_params=predictions['fused_gaussian_params'],
+                            gaussian_xyz=predictions['fused_gaussian_xyz'],
+                            temporal_tracker=temporal_tracker,
+                            loss_config=loss_config,
+                        )
+                        temporal_gaussian_loss = temporal_gaussian_loss * loss_config.weights['temporal_gaussian']
+                    
                     # 总损失（所有损失的权重已在各函数内部根据loss_config应用）
-                    loss_total = mv_loss + mask_loss + cam_loss + sep_loss
+                    loss_total = (
+                        mv_loss + mask_loss + cam_loss + sep_loss +
+                        fusion_reproj_loss + depth_consistency_loss +
+                        gaussian_distill_loss + gaussian_reg_loss +
+                        temporal_gaussian_loss
+                    )
                     
                     # 合并损失字典
                     loss_dict = {}
@@ -2276,6 +4030,11 @@ if __name__ == "__main__":
                     loss_dict.update(mask_loss_dict)
                     loss_dict.update(cam_loss_dict)
                     loss_dict.update(sep_dict)
+                    loss_dict.update(fusion_reproj_dict)
+                    loss_dict.update(depth_consistency_dict)
+                    loss_dict.update(gaussian_distill_dict)
+                    loss_dict.update(gaussian_reg_dict)
+                    loss_dict.update(temporal_gaussian_dict)
                     loss_dict['total'] = loss_total.item()
                 
                 # 反向传播
@@ -2394,15 +4153,51 @@ if __name__ == "__main__":
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             
-            # TensorBoard: 记录每个epoch的平均损失
+            # TensorBoard: 记录每个epoch的平均损失（动态记录，只记录存在的非零损失）
+            # 注意：epoch_losses 已经在前面除以 num_batches，所以这里直接使用
+            # 总损失总是记录
             writer.add_scalar('Loss/Epoch/Total', epoch_losses['total'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Depth', epoch_losses['depth_loss'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Reproj', epoch_losses['reproj_loss'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Smoothness', epoch_losses['smoothness_loss'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Conf', epoch_losses['conf_loss'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Mask', epoch_losses['mask_loss'], epoch + 1)
-            writer.add_scalar('Loss/Epoch/Separation', epoch_losses['separation_loss'], epoch + 1)
+            
+            # 定义损失映射：TensorBoard标签 -> epoch_losses中的键名
+            # 这样便于后续扩展和统一命名，支持多个可能的键名（向后兼容）
+            loss_mapping = {
+                'Loss/Epoch/Depth': ['L_depth_point', 'depth_loss'],  # 深度到点的损失
+                'Loss/Epoch/Reproj': ['L_mv_geo', 'reproj_loss', 'L_epi'],  # 多视角几何/重投影损失
+                'Loss/Epoch/Smoothness': ['L_smooth_edge', 'smoothness_loss'],  # 平滑度损失
+                'Loss/Epoch/Conf': ['L_uncert', 'conf_loss'],  # 不确定性/置信度损失
+                'Loss/Epoch/Scale': ['L_scale', 'scale_loss'],  # 尺度一致性损失
+                'Loss/Epoch/Photo': ['L_photo', 'photo_loss'],  # 光度一致性损失
+                'Loss/Epoch/Mask': ['mask_loss'],  # 掩码总损失
+                'Loss/Epoch/Mask_CE': ['mask_ce_loss'],  # 掩码交叉熵损失
+                'Loss/Epoch/Mask_Boundary': ['mask_boundary_loss'],  # 掩码边界损失
+                'Loss/Epoch/Mask_Temporal': ['mask_temporal_loss'],  # 掩码时序一致性损失
+                'Loss/Epoch/Cam_Const': ['L_cam_const', 'cam_const_loss'],  # 相机一致性损失
+                'Loss/Epoch/Separation': ['L_sep', 'separation_loss']  # 双流分离损失
+            }
+            
+            # 记录已处理的键名，避免重复记录
+            recorded_keys = set()
+            
+            # 动态记录：只记录存在的非零损失
+            for tb_tag, possible_keys in loss_mapping.items():
+                for key in possible_keys:
+                    if key in epoch_losses:
+                        value = epoch_losses[key]
+                        if value != 0.0:
+                            writer.add_scalar(tb_tag, value, epoch + 1)
+                            recorded_keys.add(key)
+                        break  # 找到第一个存在的就记录，避免重复
+            
+            # 记录学习率
             writer.add_scalar('Training/LearningRate', current_lr, epoch + 1)
+            
+            # 可选：记录所有epoch_losses中的其他损失（用于调试和扩展）
+            # 这些可能不在上面的映射中，但仍然会被记录（如果非零）
+            for key, value in epoch_losses.items():
+                if key != 'total' and key not in recorded_keys:
+                    if value != 0.0:
+                        # 使用原始键名作为标签
+                        writer.add_scalar(f'Loss/Epoch/{key}', value, epoch + 1)
             
             # TensorBoard: 记录模型参数的统计信息（每个epoch一次，可选）
             if (epoch + 1) % 5 == 0:  # 每5个epoch记录一次，避免日志过大
@@ -2411,16 +4206,24 @@ if __name__ == "__main__":
                         writer.add_histogram(f'Parameters/{name}', param.data, epoch + 1)
                         writer.add_histogram(f'Gradients/{name}', param.grad.data, epoch + 1)
             
-            # 打印epoch总结
-            print(f"\nEpoch {epoch+1}/{num_epochs} Summary:")
-            print(f"  Total Loss: {epoch_losses['total']:.6f}")
-            print(f"  Depth Loss: {epoch_losses['depth_loss']:.6f}")
-            print(f"  Smoothness Loss: {epoch_losses['smoothness_loss']:.6f}")
-            print(f"  Conf Loss: {epoch_losses['conf_loss']:.6f}")
-            print(f"  Mask Loss: {epoch_losses['mask_loss']:.6f}")
-            print(f"  Separation Loss: {epoch_losses['separation_loss']:.6f}")
-            print(f"  Learning Rate: {current_lr:.8f}")
-            print("-"*60)
+            # 每个epoch结束保存综合结果（点云、体素、images大图、深度大图）
+            if sample_images_for_pointcloud is not None:
+                try:
+                    print(f"  🎯 Saving comprehensive results for epoch {epoch+1}...")
+                    save_comprehensive_results_epoch(
+                        model_mv, 
+                        sample_images_for_pointcloud, 
+                        device, 
+                        pointcloud_save_dir, 
+                        epoch,
+                        sample_idx=0,  # 使用batch中的第一个样本
+                        downsample_ratio=2  # 下采样以减少点云数量
+                    )
+
+                except Exception as e:
+                    print(f"  ⚠️  Warning: Failed to save comprehensive results for epoch {epoch+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # 每10个epoch保存一次checkpoint
             if (epoch + 1) % 10 == 0:

@@ -26,7 +26,8 @@
                 "--images_dir", "data/images",
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "1"
+                "CUDA_VISIBLE_DEVICES": "1",
+                "DATASET_LENGTH": "10"
             }
         },{
             "name":"current file Cuda2",

@@ -151,3 +151,4 @@ skyseg.onnx
 checkpoint/
 online_img3/
 *.pt
+results/

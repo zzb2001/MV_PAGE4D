@@ -9,6 +9,7 @@
 
 
 import os
+import math
 from typing import List, Dict, Tuple, Union
 
 import torch
@@ -193,13 +194,78 @@ class DPTHead(nn.Module):
         # Reshape back to multi-view format if needed
         if is_multi_view and T is not None and V is not None:
             if self.feature_only:
-                # result is [B, T*V, C, H, W] -> [B, T, V, C, H, W]
-                result = result.reshape(B, T, V, *result.shape[2:])
+                # result is [B, S_actual, C, H, W] -> [B, T, V, C, H, W]
+                # 检查实际的序列长度是否等于 T*V
+                S_actual = result.shape[1]
+                if S_actual == T * V:
+                    result = result.reshape(B, T, V, *result.shape[2:])
+                else:
+                    # 如果实际序列长度不等于T*V，可能需要特殊处理
+                    # 这种情况下，可能需要根据实际S来推断T和V
+                    # 或者保持原样，不进行reshape
+                    if S_actual % T == 0:
+                        V_actual = S_actual // T
+                        result = result.reshape(B, T, V_actual, *result.shape[2:])
+                    elif S_actual % V == 0:
+                        T_actual = S_actual // V
+                        result = result.reshape(B, T_actual, V, *result.shape[2:])
+                    # 如果都不满足，保持原样
             else:
-                # result is tuple of ([B, T*V, ...], [B, T*V, ...]) -> ([B, T, V, ...], [B, T, V, ...])
+                # result is tuple of ([B, S_actual, ...], [B, S_actual, ...]) -> ([B, T, V, ...], [B, T, V, ...])
                 preds, conf = result
-                preds = preds.reshape(B, T, V, *preds.shape[2:])
-                conf = conf.reshape(B, T, V, *conf.shape[2:])
+                S_actual = preds.shape[1]
+                
+                # 检查实际的序列长度是否等于 T*V
+                if S_actual == T * V:
+                    # 正常情况：可以直接reshape
+                    preds = preds.reshape(B, T, V, *preds.shape[2:])
+                    conf = conf.reshape(B, T, V, *conf.shape[2:])
+                else:
+                    # 非常规情况：实际序列长度不等于T*V
+                    # 尝试根据实际S来推断T和V，但必须确保reshape是安全的
+                    total_elements_preds = preds.numel()
+                    total_elements_conf = conf.numel()
+                    
+                    # 检查是否能够安全地reshape为 (B, T, V, ...)
+                    if total_elements_preds % (B * T * V) == 0 and total_elements_conf % (B * T * V) == 0:
+                        # 可以整除，尝试reshape
+                        elements_per_btv_preds = total_elements_preds // (B * T * V)
+                        elements_per_btv_conf = total_elements_conf // (B * T * V)
+                        
+                        # 检查剩余维度的乘积是否匹配
+                        remaining_shape = preds.shape[2:]
+                        remaining_elements = 1
+                        for dim in remaining_shape:
+                            remaining_elements *= dim
+                        
+                        if remaining_elements == elements_per_btv_preds:
+                            # 可以安全reshape
+                            try:
+                                preds = preds.reshape(B, T, V, *remaining_shape)
+                                conf = conf.reshape(B, T, V, *remaining_shape)
+                            except RuntimeError as e:
+                                # reshape失败，保持原样
+                                import warnings
+                                warnings.warn(
+                                    f"Cannot reshape preds from shape {preds.shape} to (B={B}, T={T}, V={V}, ...). "
+                                    f"Actual S={S_actual}, expected S={T*V}. Error: {e}. Keeping original shape."
+                                )
+                        else:
+                            # 元素数不匹配，不能reshape
+                            import warnings
+                            warnings.warn(
+                                f"Cannot reshape preds: shape {preds.shape} cannot be reshaped to (B={B}, T={T}, V={V}, ...). "
+                                f"Actual S={S_actual}, expected S={T*V}. Remaining elements={remaining_elements}, "
+                                f"elements_per_btv={elements_per_btv_preds}. Keeping original shape."
+                            )
+                    else:
+                        # 不能整除，无法reshape为 (B, T, V, ...)
+                        import warnings
+                        warnings.warn(
+                            f"Cannot reshape preds: total elements {total_elements_preds} cannot be divided by B*T*V={B*T*V}. "
+                            f"Actual S={S_actual}, expected S={T*V}. Keeping original shape."
+                        )
+                
                 result = (preds, conf)
         
         return result
@@ -242,6 +308,9 @@ class DPTHead(nn.Module):
 
         out = []
         dpt_idx = 0
+        
+        # 在第一层确定实际的 S 值（如果与预期不同）
+        actual_S = S
 
         for layer_idx in self.intermediate_layer_idx:
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
@@ -250,11 +319,75 @@ class DPTHead(nn.Module):
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
 
-            x = x.reshape(B * S, -1, x.shape[-1])
+            # 处理不同的输入形状
+            # aggregated_tokens_list 可能是 (B, S, P, C) 或 (B*S, P, C)
+            if len(x.shape) == 4:
+                # 形状是 (B, S, P, C)，需要先reshape为 (B*S, P, C)
+                x = x.reshape(-1, x.shape[2], x.shape[3])
+                # 更新 actual_S（只在第一次循环时）
+                if dpt_idx == 0:
+                    actual_S = x.shape[0] // B
+            elif len(x.shape) == 3:
+                # 形状是 (B*S, P, C) 或类似，需要确保第一个维度正确
+                # 如果第一个维度不匹配 B*S，根据实际元素数计算正确的形状
+                total_elements = x.numel()
+                expected_first_dim = B * actual_S
+                expected_elements = expected_first_dim * x.shape[-1]
+                
+                if total_elements % expected_elements == 0:
+                    # 可以整除，reshape为期望的形状
+                    mid_dim = total_elements // expected_elements
+                    x = x.reshape(expected_first_dim, mid_dim, x.shape[-1])
+                else:
+                    # 不能整除，使用实际的第一个维度
+                    actual_first_dim = x.shape[0]
+                    if actual_first_dim % B == 0:
+                        # 可以整除B，说明是有效的批次结构
+                        layer_actual_S = actual_first_dim // B
+                        mid_dim = total_elements // (actual_first_dim * x.shape[-1])
+                        x = x.reshape(actual_first_dim, mid_dim, x.shape[-1])
+                        # 更新 actual_S（只在第一次循环时，确保所有层使用相同的S）
+                        if dpt_idx == 0:
+                            actual_S = layer_actual_S
+                    else:
+                        # 尝试直接reshape为 (actual_first_dim, -1, C)
+                        x = x.reshape(actual_first_dim, -1, x.shape[-1])
+                        if dpt_idx == 0:
+                            actual_S = actual_first_dim // B if actual_first_dim % B == 0 else actual_S
+            else:
+                raise ValueError(f"Unexpected shape for aggregated_tokens_list[{layer_idx}]: {x.shape}, expected 3D or 4D")
 
             x = self.norm(x)
 
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            # 计算实际的patch数量
+            # x的形状应该是 (B*S, P, C)，其中P是patch数量
+            actual_P = x.shape[1]  # 中间维度是patch数量
+            
+            # 检查实际的P是否等于patch_h * patch_w
+            expected_P = patch_h * patch_w
+            if actual_P == expected_P:
+                # 常规情况：P = patch_h * patch_w，可以直接reshape
+                x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            else:
+                # 非常规情况：P != patch_h * patch_w（例如体素化的情况）
+                # 需要根据实际的P值来计算合适的patch_h和patch_w
+                # 尝试找到能够整除actual_P的h和w，使其最接近正方形
+                sqrt_P = int(math.sqrt(actual_P))
+                
+                # 从sqrt_P开始向下查找，找到能整除actual_P的最大h
+                found_shape = False
+                for test_h in range(sqrt_P, 0, -1):
+                    if actual_P % test_h == 0:
+                        test_w = actual_P // test_h
+                        # 使用找到的h和w进行reshape
+                        x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], test_h, test_w))
+                        found_shape = True
+                        break
+                
+                if not found_shape:
+                    # 理论上不应该到这里，因为任何数都能被1整除
+                    # 但如果真的到这里，使用1作为高度
+                    x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], 1, actual_P))
 
             x = self.projects[dpt_idx](x)
             if self.pos_embed:
@@ -278,13 +411,13 @@ class DPTHead(nn.Module):
             out = self._apply_pos_embed(out, W, H)
 
         if self.feature_only:
-            return out.view(B, S, *out.shape[1:])
+            return out.view(B, actual_S, *out.shape[1:])
 
         out = self.scratch.output_conv2(out)
         preds, conf = activate_head(out, activation=self.activation, conf_activation=self.conf_activation)
 
-        preds = preds.view(B, S, *preds.shape[1:])
-        conf = conf.view(B, S, *conf.shape[1:])
+        preds = preds.view(B, actual_S, *preds.shape[1:])
+        conf = conf.view(B, actual_S, *conf.shape[1:])
         return preds, conf
 
     def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
